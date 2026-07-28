@@ -1,0 +1,12 @@
+[package]
+name = "syncshell"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "syncshell"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.35.0"
+syncshell-ui = { path = "../syncshell-ui" }

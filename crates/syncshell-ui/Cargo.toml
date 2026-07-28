@@ -1,0 +1,13 @@
+[package]
+name = "syncshell-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+alacritty_terminal = "0.24"
+eframe = "0.35.0"
+egui = "0.35.0"
+open = { version = "5.4.0", features = ["shellexecute-on-windows"] }
+syncshell-core = { path = "../syncshell-core" }
+fontdb = "0.23"
+ttf-parser = "0.25"

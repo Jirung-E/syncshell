@@ -1,0 +1,12 @@
+# ⚠️ [counter] 섹션은 자동 관리 필드 — 절대 수동으로 수정하지 마십시오.
+# last_number 는 부여된 quest ID 가 재사용되지 않도록 보호하는 단조 증가 카운터.
+#   - 줄이면 ID 중복으로 데이터 손상 발생.
+#   - 늘리면 번호 건너뛰어 추적이 어려워짐.
+# 시작 시 실제 quest 파일들의 max 번호와 검증하여 보호합니다.
+
+prefix = "REQ"
+color = "#7BB87F"
+description = "기능 요청"
+
+[counter]
+last_number = 0

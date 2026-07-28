@@ -1,0 +1,5 @@
+sort_order = 4
+name_en = "Done"
+name_ko = "완료"
+color = "#7BB87F"
+counts_as_done = true

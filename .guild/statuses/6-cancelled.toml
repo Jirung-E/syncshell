@@ -1,0 +1,5 @@
+sort_order = 6
+name_en = "Cancelled"
+name_ko = "취소됨"
+color = "#E94F4F"
+counts_as_done = true

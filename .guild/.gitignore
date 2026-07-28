@@ -1,0 +1,7 @@
+index.db
+positions.json
+backups/
+.lock
+
+quests/*.memo.md
+campaigns/*.memo.md
