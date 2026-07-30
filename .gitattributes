@@ -1,0 +1,13 @@
+# 줄바꿈을 저장소·작업트리 모두 LF로 고정한다.
+#
+# 지금은 Windows 전용이지만 2·3단계에서 WSL/Linux/macOS로 확장할 계획이라,
+# 개발자별 core.autocrlf 설정에 따라 줄바꿈이 섞이면 실제 변경과 무관한
+# diff가 생긴다. 머신 설정과 무관하게 여기서 못박는다.
+* text=auto eol=lf
+
+# 바이너리로 취급할 것 (줄바꿈 변환 금지)
+*.png binary
+*.jpg binary
+*.ico binary
+*.ttf binary
+*.otf binary
