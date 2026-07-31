@@ -8,3 +8,6 @@ portable-pty = "0.8"
 alacritty_terminal = "0.24"
 anyhow = "1"
 notify-debouncer-mini = "0.7"
+# 휴지통 이동 — SHFileOperation/IFileOperation 직접 호출 금지 방침(DEV-008)에 따라
+# Windows 휴지통·macOS 휴지통·Linux XDG trash를 한 API로 덮는 크레이트를 쓴다.
+trash = "5"

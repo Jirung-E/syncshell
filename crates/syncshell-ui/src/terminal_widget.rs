@@ -28,6 +28,7 @@ impl TerminalWidget {
 
     /// 사전 스캔을 실제로 돌린 누적 횟수 — 테스트에서 "안 바뀐 프레임은
     /// 건너뛰는지" 확인하는 용도.
+    #[cfg(test)]
     pub fn scans_run(&self) -> u64 {
         self.scans_run
     }

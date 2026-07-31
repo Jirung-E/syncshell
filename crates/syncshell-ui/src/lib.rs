@@ -1,8 +1,11 @@
 mod ansi_color;
+mod file_panel;
 mod font_fallback;
 mod terminal_widget;
 
-use std::path::PathBuf;
+use file_panel::{FileAction, FilePanelState};
+use std::path::{Path, PathBuf};
+use syncshell_core::fsops;
 use syncshell_core::fsview::FsView;
 use syncshell_core::sync::SyncState;
 use syncshell_core::terminal::TerminalSession;
@@ -18,6 +21,8 @@ pub struct SyncShellApp {
     /// 그 줄을 끝내면(has_pending_user_input()이 false가 되면) 그때 보낸다
     /// (TR-006 피드백: "탭 자동완성 후 엔터 치면 다른 명령이 따라 들어와서 실패함").
     pending_cd: Option<String>,
+    /// 탐색기 패널이 프레임 간에 들고 있어야 하는 상태(이름 바꾸기 대화상자, 상태 메시지).
+    panel: FilePanelState,
 }
 
 impl SyncShellApp {
@@ -38,6 +43,99 @@ impl SyncShellApp {
             fs,
             sync: SyncState::new(),
             pending_cd: None,
+            panel: FilePanelState::default(),
+        }
+    }
+
+    /// 탐색기가 폴더로 이동할 때 터미널에도 `cd`를 흘려보낸다.
+    ///
+    /// 사용자가 터미널에 아직 제출 안 한 입력이 있으면(예: 탭 자동완성 중) 지금
+    /// 주입하면 그 줄 중간에 섞여 들어가 명령이 깨진다 — 안전할 때까지 대기시킨다
+    /// (`ui()` 상단에서 매 프레임 재확인해 흘려보냄. TR-006 피드백).
+    fn inject_cd(&mut self, cmd: String) {
+        let pending = self
+            .terminal
+            .as_ref()
+            .map(|s| s.has_pending_user_input())
+            .unwrap_or(false);
+        if pending {
+            self.pending_cd = Some(cmd);
+        } else if let Some(session) = &mut self.terminal {
+            let _ = session.write_input(cmd.as_bytes());
+        }
+    }
+
+    /// 조작 후 목록을 갱신한다. 워처(DEV-007)가 어차피 잡아주지만, 사용자가
+    /// 방금 누른 동작의 결과는 워처 디바운스(100ms)를 기다리지 않고 바로 보이는
+    /// 편이 자연스럽다.
+    fn refresh(&mut self) {
+        let current = self.fs.current_dir.clone();
+        self.fs.navigate(current);
+    }
+
+    fn handle_file_action(&mut self, ctx: &egui::Context, action: FileAction) {
+        match action {
+            FileAction::Navigate(path) => {
+                // 탐색기 → 터미널: 사용자가 실제로 클릭했을 때만 SyncState.user_navigated를
+                // 거친다(터미널이 유발한 이동은 ui() 상단에서 self.fs.navigate를 직접
+                // 호출하고 여기를 거치지 않으므로 다시 주입되지 않는다).
+                self.fs.navigate(path.clone());
+                let cmd = self.sync.user_navigated(path);
+                self.inject_cd(cmd);
+            }
+            FileAction::OpenFile(path) => {
+                // .lnk 바로가기는 open이 셸 수준(ShellExecute)에서 대상을 알아서
+                // 찾아 연다 — 별도 파싱 불필요(TR-006 피드백).
+                if let Err(e) = open::that(&path) {
+                    self.panel.set_error(format!("열 수 없습니다: {e}"));
+                }
+            }
+            FileAction::OpenTerminalHere(path) => {
+                // 탐색기는 그대로 두고 터미널만 그 폴더로 옮긴다. SyncState에도
+                // 알려줘야 터미널의 OSC7 응답을 "우리가 시킨 것"으로 인식하고
+                // 탐색기를 되돌리지 않는다.
+                let cmd = self.sync.user_navigated(path.clone());
+                self.inject_cd(cmd);
+                self.fs.navigate(path);
+            }
+            FileAction::CopyPath(path) => {
+                ctx.copy_text(path.display().to_string());
+                self.panel.set_info("경로를 복사했습니다");
+            }
+            FileAction::BeginRename(path) => {
+                self.panel.begin_rename(&path);
+            }
+            FileAction::Rename(path, new_name) => match fsops::rename(&path, &new_name) {
+                Ok(_) => {
+                    self.panel.status = None;
+                    self.refresh();
+                }
+                Err(e) => self.panel.set_error(e.to_string()),
+            },
+            FileAction::MoveToTrash(path) => {
+                let name = display_name(&path);
+                match fsops::move_to_trash(&path) {
+                    Ok(()) => {
+                        self.panel.set_info(format!("'{name}'을(를) 휴지통으로 보냈습니다"));
+                        self.refresh();
+                    }
+                    Err(e) => self.panel.set_error(format!("삭제할 수 없습니다: {e}")),
+                }
+            }
+            FileAction::NewFolder => {
+                let dir = self.fs.current_dir.clone();
+                match fsops::create_dir_unique(&dir, "새 폴더") {
+                    Ok(created) => {
+                        self.panel.status = None;
+                        self.refresh();
+                        // 만들자마자 이름을 바꾸도록 대화상자를 띄운다 — 탐색기가
+                        // 새 폴더를 만들면 곧바로 이름 편집 상태로 들어가는 것과 같은 흐름.
+                        self.panel.begin_rename(&created);
+                    }
+                    Err(e) => self.panel.set_error(format!("폴더를 만들 수 없습니다: {e}")),
+                }
+            }
+            FileAction::Refresh => self.refresh(),
         }
     }
 }
@@ -71,71 +169,16 @@ impl eframe::App for SyncShellApp {
         }
         self.fs.pump();
 
+        let mut action = None;
         egui::Panel::left("file_panel")
             .resizable(true)
             .default_size(320.0)
             .show(ui, |ui| {
-                ui.heading("탐색기");
-                ui.label(self.fs.current_dir.display().to_string());
-                ui.separator();
-
-                let mut navigate_to: Option<PathBuf> = None;
-
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    if let Some(parent) = self.fs.current_dir.parent() {
-                        if ui.selectable_label(false, "..").clicked() {
-                            navigate_to = Some(parent.to_path_buf());
-                        }
-                    }
-                    if let Some(err) = &self.fs.error {
-                        ui.colored_label(egui::Color32::from_rgb(0xe0, 0x6c, 0x75), err);
-                    }
-                    for entry in &self.fs.entries {
-                        let label = if entry.is_dir {
-                            format!("📁 {}", entry.name)
-                        } else {
-                            format!("   {}", entry.name)
-                        };
-                        let response = ui.selectable_label(false, &label);
-                        if entry.is_dir {
-                            // 폴더는 단일 클릭 진입 유지 — TR-003/TR-005의 동기화
-                            // 설계가 이걸 전제로 짜여 있다(DEV-015 조사 결과, 폴더까지
-                            // 더블클릭으로 바꾸면 sync 쪽 영향 범위가 커서 보류).
-                            if response.clicked() {
-                                navigate_to = Some(entry.path.clone());
-                            }
-                        } else if response.double_clicked() {
-                            // 파일은 반드시 더블클릭 — 한 번만 클릭해도 실행파일이
-                            // 열려버리던 문제(TR-006 피드백)를 막기 위해 일반
-                            // 탐색기처럼 더블클릭을 요구한다.
-                            // .lnk 바로가기는 open이 셸 수준(ShellExecute)에서 대상을
-                            // 알아서 찾아 연다 — 별도 파싱 불필요(TR-006 피드백).
-                            let _ = open::that(&entry.path);
-                        }
-                    }
-                });
-
-                // 탐색기 → 터미널: 사용자가 실제로 클릭했을 때만 SyncState.user_navigated를
-                // 거친다 (터미널이 유발한 이동은 위에서 self.fs.navigate를 직접 호출하고
-                // 여기를 거치지 않으므로 다시 주입되지 않는다).
-                if let Some(path) = navigate_to {
-                    self.fs.navigate(path.clone());
-                    let cmd = self.sync.user_navigated(path);
-                    // 사용자가 터미널에 아직 제출 안 한 입력이 있으면(예: 탭 자동완성
-                    // 중) 지금 주입하면 그 줄 중간에 섞여 들어가 명령이 깨진다 — 안전할
-                    // 때까지 대기시킨다(위 ui() 상단에서 매 프레임 재확인해 흘려보냄).
-                    let pending = self
-                        .terminal
-                        .as_ref()
-                        .map(|s| s.has_pending_user_input())
-                        .unwrap_or(false);
-                    if pending {
-                        self.pending_cd = Some(cmd);
-                    } else if let Some(session) = &mut self.terminal {
-                        let _ = session.write_input(cmd.as_bytes());
-                    }
-                }
+                action = file_panel::show(ui, &self.fs, &mut self.panel);
             });
+        if let Some(action) = action {
+            self.handle_file_action(ui.ctx(), action);
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
@@ -155,6 +198,14 @@ impl eframe::App for SyncShellApp {
     fn persist_egui_memory(&self) -> bool {
         false
     }
+}
+
+/// 오류 메시지에 쓸 사람이 읽기 좋은 이름(마지막 경로 조각). 드라이브 루트처럼
+/// 파일명이 없는 경우엔 전체 경로를 그대로 쓴다.
+fn display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 pub fn run() -> eframe::Result<()> {

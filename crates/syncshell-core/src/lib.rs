@@ -1,3 +1,4 @@
+pub mod fsops;
 pub mod fsview;
 pub mod osc7;
 pub mod pty;
