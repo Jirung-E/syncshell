@@ -1,5 +1,6 @@
 use crate::ansi_color::{resolve_bg, resolve_fg, DEFAULT_BG};
 use crate::font_fallback::FontFallback;
+use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::term::cell::Flags;
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Vec2};
 use syncshell_core::terminal::TerminalSession;
@@ -59,14 +60,88 @@ impl TerminalWidget {
         })
     }
 
+    /// 마우스로 텍스트를 선택한다(DEV-012). 선택 상태 자체는 alacritty_terminal의
+    /// `Selection`이 들고 있고(스크롤·리사이즈 시 좌표 보정까지 해준다), 여기서는
+    /// 화면 좌표를 셀 좌표로 바꿔 넘기기만 한다.
+    fn handle_selection_mouse(
+        &self,
+        ui: &egui::Ui,
+        response: &egui::Response,
+        session: &mut TerminalSession,
+        rect: Rect,
+        cell: Vec2,
+    ) {
+        use alacritty_terminal::selection::{Selection, SelectionType};
+
+        let Some(pos) = response.interact_pointer_pos() else {
+            return;
+        };
+        let (point, side) = pos_to_cell(pos, rect, cell, session);
+
+        // 더블클릭=단어, 트리플클릭=줄. egui는 트리플클릭도 double_clicked()를
+        // true로 보고하므로 트리플을 먼저 본다 — 순서를 바꾸면 줄 선택이 안 된다.
+        if response.triple_clicked() {
+            session.term.selection = Some(Selection::new(SelectionType::Lines, point, side));
+        } else if response.double_clicked() {
+            session.term.selection = Some(Selection::new(SelectionType::Semantic, point, side));
+        } else if response.drag_started() {
+            // 드래그의 시작점은 **버튼을 누른 위치**여야 한다. `drag_started()`가
+            // true가 되는 시점엔 egui의 드래그 판정 문턱만큼 포인터가 이미 움직인
+            // 뒤라, 지금 위치를 앵커로 쓰면 처음 몇 글자가 선택에서 빠진다
+            // (실측: "SELECTME"를 끌었는데 "ECTME"만 선택됨).
+            let origin = ui
+                .input(|i| i.pointer.press_origin())
+                .unwrap_or(pos);
+            let (start, start_side) = pos_to_cell(origin, rect, cell, session);
+            let mut selection = Selection::new(SelectionType::Simple, start, start_side);
+            // 앵커를 누른 자리에 두고, 현재 위치까지 즉시 확장한다.
+            selection.update(point, side);
+            session.term.selection = Some(selection);
+        } else if response.dragged() {
+            if let Some(selection) = session.term.selection.as_mut() {
+                selection.update(point, side);
+            }
+        } else if response.clicked() {
+            // 그냥 클릭하면 선택 해제(일반 터미널·에디터와 동일).
+            session.term.selection = None;
+        }
+
+        // 선택 중 위/아래로 끌면 스크롤백이 따라 움직여야 화면 밖 내용도 선택할 수 있다.
+        if response.dragged() {
+            let above = rect.top() - pos.y;
+            let below = pos.y - rect.bottom();
+            let lines = if above > 0.0 {
+                (above / cell.y).ceil() as i32
+            } else if below > 0.0 {
+                -((below / cell.y).ceil() as i32)
+            } else {
+                0
+            };
+            if lines != 0 {
+                session
+                    .term
+                    .scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
+                ui.ctx().request_repaint();
+            }
+        }
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui, session: &mut TerminalSession) {
         let cell = self.cell_size(ui.ctx());
-        let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
+        // 드래그로 텍스트를 선택해야 하므로 클릭만이 아니라 드래그도 받는다(DEV-012).
+        let (rect, response) =
+            ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
         if !ui.is_rect_visible(rect) {
             return;
         }
 
         claim_terminal_focus(ui, &response);
+
+        // 그리드 크기를 먼저 뷰포트에 맞춘다 — 아래 마우스 좌표 → 셀 좌표 변환이
+        // 현재 프레임의 그리드 크기를 기준으로 계산되어야 한다.
+        let cols = (rect.width() / cell.x).floor().max(1.0) as u16;
+        let rows = (rect.height() / cell.y).floor().max(1.0) as u16;
+        session.resize(cols, rows);
 
         // 키/텍스트 입력 — 예광탄 범위: 일반 문자, Enter, Backspace, 방향키, Ctrl+C.
         // PageUp/PageDown/휠 스크롤은 셸로 보내는 게 아니라 로컬 스크롤백 뷰포트만
@@ -76,6 +151,13 @@ impl TerminalWidget {
         let mut input_bytes: Vec<u8> = Vec::new();
         let mut scroll_lines: i32 = 0;
         let mut page_scroll: Option<alacritty_terminal::grid::Scroll> = None;
+        let mut copy_requested = false;
+        // Ctrl+C를 복사로 볼지 인터럽트(SIGINT)로 볼지 가르는 기준 — 아래 참고.
+        let has_selection = session
+            .term
+            .selection
+            .as_ref()
+            .is_some_and(|s| !s.is_empty());
         ui.input(|i| {
             for event in &i.events {
                 match event {
@@ -116,6 +198,13 @@ impl TerminalWidget {
                         egui::Key::Home => input_bytes.extend_from_slice(b"\x1b[H"),
                         egui::Key::End => input_bytes.extend_from_slice(b"\x1b[F"),
                         egui::Key::Delete => input_bytes.extend_from_slice(b"\x1b[3~"),
+                        // Ctrl+Shift+C는 선택 여부와 무관하게 항상 복사(리눅스 터미널 관례).
+                        egui::Key::C if modifiers.ctrl && modifiers.shift => copy_requested = true,
+                        // Ctrl+C는 선택이 있으면 복사, 없으면 인터럽트(0x03) — Windows
+                        // Terminal과 같은 규칙이다. 터미널에서 Ctrl+C는 원래 실행 중인
+                        // 명령을 끊는 키라 무조건 복사로 바꿔버리면 그 기능을 잃는데,
+                        // 선택이 있을 때만 복사로 해석하면 둘 다 자연스럽게 쓸 수 있다.
+                        egui::Key::C if modifiers.ctrl && has_selection => copy_requested = true,
                         egui::Key::C if modifiers.ctrl => input_bytes.push(0x03),
                         egui::Key::PageUp => page_scroll = Some(alacritty_terminal::grid::Scroll::PageUp),
                         egui::Key::PageDown => page_scroll = Some(alacritty_terminal::grid::Scroll::PageDown),
@@ -127,7 +216,20 @@ impl TerminalWidget {
         });
         if !input_bytes.is_empty() {
             let _ = session.write_keyboard_input(&input_bytes);
+            // 타이핑하면 선택을 푼다 — 일반 터미널과 같은 동작. 선택해둔 채로
+            // 명령을 계속 치면 화면이 반전된 채 남아 헷갈린다.
+            session.term.selection = None;
         }
+
+        if copy_requested {
+            if let Some(text) = session.term.selection_to_string() {
+                if !text.is_empty() {
+                    ui.ctx().copy_text(text);
+                }
+            }
+        }
+
+        self.handle_selection_mouse(ui, &response, session, rect, cell);
 
         // 휠 스크롤 — 터미널 위에 마우스가 있을 때만(파일 패널 스크롤과 겹치지 않게).
         // smooth_scroll_delta.y가 양수(휠을 위로 밀어 화면이 아래로 내려가는 제스처)면
@@ -145,10 +247,6 @@ impl TerminalWidget {
                 .term
                 .scroll_display(alacritty_terminal::grid::Scroll::Delta(scroll_lines));
         }
-
-        let cols = (rect.width() / cell.x).floor().max(1.0) as u16;
-        let rows = (rect.height() / cell.y).floor().max(1.0) as u16;
-        session.resize(cols, rows);
 
         // 코드포인트 폴백 사전 스캔(DEV-011) — 이번 프레임에 그릴 글자 중 지금
         // 로드된 폰트로 못 그리는 게 있으면 시스템에서 찾아 등록한다.
@@ -200,6 +298,7 @@ impl TerminalWidget {
         // alacritty_terminal이 제공하는 `term::point_to_viewport()`와 같은 공식
         // (line + display_offset)으로 뷰포트 상대 좌표로 변환해야 한다.
         let display_offset = content.display_offset as i32;
+        let selection = content.selection;
         for indexed in content.display_iter {
             let point = indexed.point;
             let viewport_line = point.line.0 + display_offset;
@@ -215,13 +314,21 @@ impl TerminalWidget {
             let y = rect.top() + viewport_line as f32 * cell.y;
             let width = if flags.contains(Flags::WIDE_CHAR) { cell.x * 2.0 } else { cell.x };
 
-            let bg_color = resolve_bg(bg);
+            // 선택된 셀은 전경/배경을 뒤집어 그린다(DEV-012). 선택색을 따로 두면
+            // 그 위의 글자색에 따라 안 보이는 조합이 생기는데, 반전은 원래 대비를
+            // 그대로 유지해서 어떤 배색에서도 읽힌다.
+            let selected = selection.is_some_and(|s| s.contains(point));
+            let (bg_color, fg_color) = if selected {
+                (resolve_fg(fg), resolve_bg(bg))
+            } else {
+                (resolve_bg(bg), resolve_fg(fg))
+            };
+
             if bg_color != DEFAULT_BG {
                 painter.rect_filled(Rect::from_min_size(Pos2::new(x, y), Vec2::new(width, cell.y)), 0.0, bg_color);
             }
 
             if c != ' ' && c != '\0' {
-                let fg_color = resolve_fg(fg);
                 painter.text(Pos2::new(x, y), egui::Align2::LEFT_TOP, c, self.font_id.clone(), fg_color);
             }
         }
@@ -260,6 +367,32 @@ impl Default for TerminalWidget {
 /// "탭 치면서 탐색기쪽 폴더가 선택되고 엔터 치면 cd가 입력되어버림" — 이전에
 /// PTY 타이밍 문제로 오판했던 것과는 다른 원인). 아래 테스트가 이 함수를
 /// 그대로 재사용해 회귀를 잡는다.
+/// 화면 좌표를 터미널 셀 좌표로 바꾼다. 돌려주는 `Point.line`은 **그리드 좌표**라
+/// 스크롤백을 보고 있으면 음수가 된다 — `display_offset`을 빼는 게 그 변환이다
+/// (렌더 루프가 반대로 더하는 것과 짝을 이룬다, DEV-003 참고).
+///
+/// `Side`는 셀의 왼쪽 절반인지 오른쪽 절반인지로, 선택 경계가 글자 앞에서 끊기는지
+/// 뒤에서 끊기는지를 정한다 — 이게 없으면 드래그 시작점의 글자가 통째로 빠지거나
+/// 하나 더 붙는다.
+fn pos_to_cell(pos: Pos2, rect: Rect, cell: Vec2, session: &TerminalSession) -> (Point, Side) {
+    use alacritty_terminal::grid::Dimensions;
+
+    let cols = session.term.columns();
+    let rows = session.term.screen_lines();
+
+    let rel_x = ((pos.x - rect.left()) / cell.x).max(0.0);
+    let col = (rel_x.floor() as usize).min(cols.saturating_sub(1));
+    let side = if rel_x.fract() < 0.5 { Side::Left } else { Side::Right };
+
+    let rel_y = ((pos.y - rect.top()) / cell.y).max(0.0);
+    let viewport_row = (rel_y.floor() as usize).min(rows.saturating_sub(1));
+
+    let display_offset = session.term.grid().display_offset() as i32;
+    let line = viewport_row as i32 - display_offset;
+
+    (Point::new(Line(line), Column(col)), side)
+}
+
 fn claim_terminal_focus(ui: &mut egui::Ui, response: &egui::Response) {
     response.request_focus();
     ui.memory_mut(|m| {
@@ -692,6 +825,314 @@ mod tests {
         assert!(
             widget.scans_run() > before,
             "새 출력이 왔는데도 스캔을 안 돌림 — 새 글자가 두부로 남게 됨"
+        );
+    }
+
+    // ---- DEV-012: 선택·복사 ----
+
+    /// 선택·복사 테스트용 하네스. 실제 PowerShell 세션 위에서 진짜 위젯 코드를
+    /// 돌리고, 합성 마우스/키 이벤트를 넣어 결과를 읽는다.
+    struct SelectionHarness {
+        ctx: egui::Context,
+        widget: TerminalWidget,
+        session: TerminalSession,
+        rect: egui::Rect,
+    }
+
+    impl SelectionHarness {
+        fn new() -> Self {
+            let ctx = egui::Context::default();
+            let mut widget = TerminalWidget::new();
+            widget.install_fonts(&ctx);
+            let session =
+                TerminalSession::spawn("powershell.exe", 120, 30, || {}).expect("spawn powershell");
+            let mut h = Self {
+                ctx,
+                widget,
+                session,
+                rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 600.0)),
+            };
+            h.run_frames(50, |_| {}); // 스폰 정착
+            h
+        }
+
+        /// `n` 프레임을 돌린다. `fill`은 프레임마다 RawInput을 꾸미는 훅.
+        /// 복사 명령이 나왔으면 마지막으로 복사된 문자열을 돌려준다.
+        fn run_frames(&mut self, n: usize, mut fill: impl FnMut(&mut egui::RawInput)) -> Option<String> {
+            let mut copied = None;
+            for _ in 0..n {
+                self.session.pump();
+                let mut input = egui::RawInput::default();
+                input.screen_rect = Some(self.rect);
+                fill(&mut input);
+                let widget = &mut self.widget;
+                let session = &mut self.session;
+                let out = self.ctx.run_ui(input, |ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ui, |ui| widget.show(ui, session));
+                });
+                for cmd in &out.platform_output.commands {
+                    if let egui::OutputCommand::CopyText(text) = cmd {
+                        copied = Some(text.clone());
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            copied
+        }
+
+        fn cell_size(&self) -> Vec2 {
+            self.widget.cell_size(&self.ctx)
+        }
+
+        /// 셀 안의 좌표. `frac_x`는 셀 안에서의 가로 위치(0.0=왼쪽 끝, 1.0=오른쪽 끝).
+        /// 선택 경계는 셀의 어느 쪽 절반을 눌렀는지로 정해지므로(Side::Left/Right)
+        /// 이 값이 어느 글자까지 포함되는지를 좌우한다.
+        fn cell_pos(&self, col: usize, viewport_row: usize, frac_x: f32) -> egui::Pos2 {
+            let cell = self.cell_size();
+            egui::Pos2::new(
+                self.rect.left() + (col as f32 + frac_x) * cell.x,
+                self.rect.top() + (viewport_row as f32 + 0.5) * cell.y,
+            )
+        }
+
+        /// 화면에서 주어진 텍스트가 있는 뷰포트 행을 찾는다.
+        fn find_row(&self, needle: &str) -> Option<usize> {
+            use alacritty_terminal::grid::Dimensions;
+            let content = self.session.term.renderable_content();
+            let offset = content.display_offset as i32;
+            let rows = self.session.term.screen_lines();
+            let mut lines = vec![String::new(); rows];
+            for indexed in content.display_iter {
+                let l = indexed.point.line.0 + offset;
+                if l >= 0 && (l as usize) < rows {
+                    lines[l as usize].push(indexed.cell.c);
+                }
+            }
+            lines.iter().position(|l| l.contains(needle))
+        }
+
+        fn dump_screen(&self) -> String {
+            use alacritty_terminal::grid::Dimensions;
+            let content = self.session.term.renderable_content();
+            let offset = content.display_offset as i32;
+            let rows = self.session.term.screen_lines();
+            let mut lines = vec![String::new(); rows];
+            for indexed in content.display_iter {
+                let l = indexed.point.line.0 + offset;
+                if l >= 0 && (l as usize) < rows {
+                    lines[l as usize].push(indexed.cell.c);
+                }
+            }
+            lines
+                .iter()
+                .map(|l| l.trim_end())
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        /// `col_from`부터 `col_to`까지(양끝 포함) 드래그로 선택한다.
+        /// 시작은 첫 글자의 왼쪽 부분(0.25), 끝은 마지막 글자의 오른쪽 부분(0.75)을
+        /// 눌러 두 글자가 모두 선택에 들어가게 한다 — 실제 사용자가 "이 글자부터
+        /// 이 글자까지" 끌 때의 손 위치와 같다.
+        fn drag_select(&mut self, row: usize, col_from: usize, col_to: usize) {
+            let from = self.cell_pos(col_from, row, 0.25);
+            let to = self.cell_pos(col_to, row, 0.75);
+            // 누르고 → 끌고 → 뗀다. egui가 드래그로 인식하려면 누른 상태로
+            // 위치가 바뀐 프레임이 있어야 한다.
+            self.run_frames(1, |i| {
+                i.events.push(egui::Event::PointerButton {
+                    pos: from,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            });
+            for step in 1..=3 {
+                let t = step as f32 / 3.0;
+                let pos = egui::Pos2::new(from.x + (to.x - from.x) * t, from.y);
+                self.run_frames(1, |i| i.events.push(egui::Event::PointerMoved(pos)));
+            }
+            self.run_frames(1, |i| {
+                i.events.push(egui::Event::PointerButton {
+                    pos: to,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            });
+        }
+
+        fn press_ctrl_c(&mut self) -> Option<String> {
+            self.run_frames(1, |i| {
+                i.events.push(egui::Event::Key {
+                    key: egui::Key::C,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL,
+                });
+            })
+        }
+    }
+
+    /// DEV-012 핵심: 드래그로 고른 영역이 실제로 선택되고, Ctrl+C로 그 텍스트가
+    /// 클립보드로 나가는지 — 실제 PowerShell 출력 위에서 프로덕션 경로로 확인한다.
+    #[test]
+    fn drag_selection_then_ctrl_c_copies_selected_text() {
+        let mut h = SelectionHarness::new();
+        h.session
+            .write_input(b"Write-Host 'SELECTME-ABCDEFGH'\r")
+            .expect("write");
+        h.run_frames(60, |_| {});
+
+        let row = h
+            .find_row("SELECTME-ABCDEFGH")
+            .expect("출력한 문자열이 화면에 없음 — 테스트 시나리오가 잘못됨");
+        // 'SELECTME-ABCDEFGH'가 시작하는 열을 찾는다.
+        let col = {
+            use alacritty_terminal::grid::Dimensions;
+            let content = h.session.term.renderable_content();
+            let offset = content.display_offset as i32;
+            let cols = h.session.term.columns();
+            let mut line = vec![' '; cols];
+            for indexed in content.display_iter {
+                let l = indexed.point.line.0 + offset;
+                if l == row as i32 {
+                    let c = indexed.point.column.0;
+                    if c < cols {
+                        line[c] = indexed.cell.c;
+                    }
+                }
+            }
+            let text: String = line.iter().collect();
+            text.find("SELECTME").expect("행 안에서 문자열을 못 찾음")
+        };
+
+        // "SELECTME" 8글자만 선택한다.
+        h.drag_select(row, col, col + 7);
+
+        let selected = h.session.term.selection_to_string().unwrap_or_default();
+        println!("선택된 텍스트: {selected:?}");
+        assert!(
+            selected.contains("SELECTME"),
+            "드래그했는데 선택 내용이 예상과 다름: {selected:?}"
+        );
+
+        let copied = h.press_ctrl_c().expect("Ctrl+C를 눌렀는데 복사 명령이 안 나옴");
+        println!("복사된 텍스트: {copied:?}");
+        assert!(
+            copied.contains("SELECTME"),
+            "복사된 내용이 선택과 다름: {copied:?}"
+        );
+    }
+
+    /// 선택이 없을 때의 Ctrl+C는 복사가 아니라 인터럽트 바이트(0x03)로 가야 한다.
+    /// 셸에 실제로 전달됐는지는 **프롬프트에서 치던 줄이 취소되는지**로 확인한다
+    /// (PSReadLine이 `^C`를 찍고 줄을 버린 뒤 새 프롬프트를 낸다).
+    ///
+    /// **실행 중인 명령을 끊는 것**은 이걸로 검증하지 않는다 — ConPTY에서 0x03만
+    /// 써넣어서는 그게 안 된다는 걸 실측으로 확인했다(`examples/ctrlc_check.rs`).
+    /// 명령 실행 중엔 셸이 stdin을 읽지 않아서 콘솔 CTRL_C_EVENT가 필요한데,
+    /// 그건 이 퀘스트 범위 밖의 별도 버그다(BUG-001).
+    #[test]
+    fn ctrl_c_without_selection_sends_interrupt_instead_of_copying() {
+        let mut h = SelectionHarness::new();
+        assert!(
+            h.session.term.selection.is_none(),
+            "시작부터 선택이 있으면 이 테스트의 전제가 깨짐"
+        );
+
+        // Enter 없이 명령을 치기만 한다 — 이 줄이 취소돼야 한다.
+        h.run_frames(1, |i| {
+            i.events
+                .push(egui::Event::Text("Write-Host 'MUST-NOT-RUN'".to_string()))
+        });
+        h.run_frames(40, |_| {});
+        assert!(
+            h.find_row("MUST-NOT-RUN").is_some(),
+            "타이핑한 내용이 화면에 안 나옴 — 테스트 전제가 깨짐"
+        );
+
+        let copied = h.press_ctrl_c();
+        assert_eq!(copied, None, "선택이 없는데 Ctrl+C가 복사로 처리됨");
+        h.run_frames(60, |_| {});
+        println!("=== Ctrl+C 후 화면 ===\n{}", h.dump_screen());
+
+        // 줄이 취소됐으면 PSReadLine이 ^C를 찍었고, 그 명령은 실행되지 않는다.
+        assert!(
+            h.dump_screen().contains("^C"),
+            "Ctrl+C를 눌렀는데 셸이 ^C를 표시하지 않음 — 0x03이 전달되지 않았다"
+        );
+
+        // 새 명령이 정상 실행되는지로 프롬프트가 살아있음을 확인하고,
+        // 취소된 명령이 실행되지 않았음을 함께 본다.
+        h.session
+            .write_input(b"Write-Host 'PROMPT-ALIVE'\r")
+            .expect("write");
+        h.run_frames(80, |_| {});
+        let screen = h.dump_screen();
+        assert!(
+            screen.contains("PROMPT-ALIVE"),
+            "Ctrl+C 후 프롬프트가 살아있지 않음"
+        );
+        assert!(
+            !screen.lines().any(|l| l.trim() == "MUST-NOT-RUN"),
+            "취소했어야 할 명령이 실행돼버림"
+        );
+    }
+
+    /// 타이핑하면 선택이 풀려야 한다 — 선택해둔 채로 명령을 계속 치면 화면이
+    /// 반전된 채 남아 헷갈린다(일반 터미널과 같은 동작).
+    #[test]
+    fn typing_clears_selection() {
+        let mut h = SelectionHarness::new();
+        h.session.write_input(b"Write-Host 'CLEARME'\r").expect("write");
+        h.run_frames(60, |_| {});
+
+        let row = h.find_row("CLEARME").expect("출력이 화면에 없음");
+        h.drag_select(row, 0, 10);
+        assert!(
+            h.session.term.selection.is_some(),
+            "드래그했는데 선택이 안 만들어짐"
+        );
+
+        h.run_frames(1, |i| i.events.push(egui::Event::Text("x".to_string())));
+        assert!(
+            h.session.term.selection.is_none(),
+            "타이핑했는데 선택이 안 풀림"
+        );
+    }
+
+    /// 화면 좌표 → 셀 좌표 변환이 스크롤백(display_offset)을 반영하는지.
+    /// 렌더 루프는 반대로 display_offset을 더하므로(DEV-003), 여기서 빼지 않으면
+    /// 스크롤백을 보고 있을 때 엉뚱한 줄이 선택된다.
+    #[test]
+    fn pos_to_cell_accounts_for_scrollback_offset() {
+        let mut h = SelectionHarness::new();
+        // 스크롤백을 쌓는다.
+        h.session
+            .write_input(b"1..80 | ForEach-Object { Write-Host \"line$_\" }\r")
+            .expect("write");
+        h.run_frames(80, |_| {});
+
+        let cell = h.cell_size();
+        let pos = egui::Pos2::new(h.rect.left() + cell.x * 0.5, h.rect.top() + cell.y * 2.5);
+
+        let (point_bottom, _) = pos_to_cell(pos, h.rect, cell, &h.session);
+        assert_eq!(point_bottom.line.0, 2, "스크롤 안 한 상태에서 뷰포트 행과 그리드 행이 달라짐");
+
+        // 스크롤백으로 10줄 올라간다.
+        h.session
+            .term
+            .scroll_display(alacritty_terminal::grid::Scroll::Delta(10));
+        let (point_scrolled, _) = pos_to_cell(pos, h.rect, cell, &h.session);
+
+        assert_eq!(
+            point_scrolled.line.0, -8,
+            "스크롤백을 10줄 올렸으면 같은 화면 위치가 그리드에서 10줄 위(2-10=-8)를 가리켜야 함"
         );
     }
 }

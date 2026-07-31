@@ -1,12 +1,12 @@
-# ⚠️ [counter] 섹션은 자동 관리 필드 — 절대 수동으로 수정하지 마십시오.
-# last_number 는 부여된 quest ID 가 재사용되지 않도록 보호하는 단조 증가 카운터.
-#   - 줄이면 ID 중복으로 데이터 손상 발생.
-#   - 늘리면 번호 건너뛰어 추적이 어려워짐.
-# 시작 시 실제 quest 파일들의 max 번호와 검증하여 보호합니다.
+# WARNING: [counter] is an auto-managed field. Do not edit it by hand.
+# last_number is a monotonic counter that keeps issued quest IDs from being reused.
+#   - Lowering it can hand out a duplicate ID and corrupt data.
+#   - Raising it skips numbers and makes tracking harder.
+# On startup it is validated against the max number of the actual quest files.
 
 prefix = "BUG"
 color = "#E94F4F"
 description = "버그 보고"
 
 [counter]
-last_number = 0
+last_number = 1
