@@ -15,6 +15,10 @@ pub struct TerminalWidget {
     /// 사전 스캔을 실제로 돌린 횟수(건너뛴 프레임은 세지 않음). 위 최적화가
     /// 정말 동작하는지 테스트에서 확인하는 용도.
     scans_run: u64,
+    /// IME로 조합 중인 글자(DEV-012). **아직 확정되지 않았으므로 PTY로 보내지
+    /// 않고 화면에만 그린다** — 확정(`ImeEvent::Commit`) 시점에만 전송한다.
+    /// 비어 있으면 조합 중이 아니다.
+    preedit: String,
 }
 
 impl TerminalWidget {
@@ -24,11 +28,18 @@ impl TerminalWidget {
             fallback: FontFallback::new(),
             last_scan_key: None,
             scans_run: 0,
+            preedit: String::new(),
         }
     }
 
     /// 사전 스캔을 실제로 돌린 누적 횟수 — 테스트에서 "안 바뀐 프레임은
     /// 건너뛰는지" 확인하는 용도.
+    /// 지금 IME로 조합 중인 글자(없으면 빈 문자열).
+    #[cfg(test)]
+    pub fn preedit(&self) -> &str {
+        &self.preedit
+    }
+
     #[cfg(test)]
     pub fn scans_run(&self) -> u64 {
         self.scans_run
@@ -153,6 +164,7 @@ impl TerminalWidget {
         let mut page_scroll: Option<alacritty_terminal::grid::Scroll> = None;
         let mut copy_requested = false;
         let mut interrupt_requested = false;
+        let mut new_preedit: Option<String> = None;
         // Ctrl+C를 복사로 볼지 인터럽트(SIGINT)로 볼지 가르는 기준 — 아래 참고.
         let has_selection = session
             .term
@@ -174,6 +186,18 @@ impl TerminalWidget {
                     // 버그가 있었음 — TR-006). 같은 문제 재발을 막기 위해 \n을 \r로 바꾼다.
                     egui::Event::Paste(text) => {
                         input_bytes.extend_from_slice(text.replace('\n', "\r").as_bytes())
+                    }
+                    // IME 조합 입력(DEV-012). 조합 중인 글자는 아직 확정된 입력이
+                    // 아니므로 **PTY로 보내지 않고 화면에만 그린다** — 안 그러면
+                    // 한글 자모가 하나씩 셸로 들어가 명령이 깨진다.
+                    // 빈 문자열은 조합이 취소·종료됐다는 뜻이다.
+                    egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) => {
+                        new_preedit = Some(text.clone());
+                    }
+                    // 확정된 글자만 셸로 보낸다.
+                    egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
+                        new_preedit = Some(String::new());
+                        input_bytes.extend_from_slice(text.as_bytes());
                     }
                     egui::Event::Key {
                         key,
@@ -218,6 +242,10 @@ impl TerminalWidget {
                 }
             }
         });
+        if let Some(preedit) = new_preedit {
+            self.preedit = preedit;
+        }
+
         if !input_bytes.is_empty() {
             let _ = session.write_keyboard_input(&input_bytes);
             // 타이핑하면 선택을 푼다 — 일반 터미널과 같은 동작. 선택해둔 채로
@@ -351,12 +379,68 @@ impl TerminalWidget {
         if cursor_viewport_line >= 0 && cursor_viewport_line < rows as i32 {
             let x = rect.left() + cursor.point.column.0 as f32 * cell.x;
             let y = rect.top() + cursor_viewport_line as f32 * cell.y;
+            let cursor_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell.x, cell.y));
             painter.rect_stroke(
-                Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell.x, cell.y)),
+                cursor_rect,
                 0.0,
                 egui::Stroke::new(1.5, Color32::from_rgb(0xff, 0xff, 0xff)),
                 egui::StrokeKind::Outside,
             );
+
+            // IME 조합 중인 글자를 커서 자리에 겹쳐 그린다(DEV-012). 셸은 아직
+            // 이 글자를 모르므로(확정 전엔 안 보냄) 우리가 직접 그려줘야 사용자가
+            // 뭘 치고 있는지 볼 수 있다.
+            if !self.preedit.is_empty() {
+                self.draw_preedit(&painter, Pos2::new(x, y), cell, rect);
+            }
+
+            // IME 후보창이 커서를 따라오게 좌표를 알려준다. 이걸 설정해야
+            // egui-winit이 창의 IME를 켜기도 한다(set_ime_allowed) — 없으면
+            // 조합 이벤트 자체가 안 온다.
+            ui.output_mut(|o| {
+                o.ime = Some(egui::output::IMEOutput {
+                    rect,
+                    cursor_rect,
+                    should_interrupt_composition: false,
+                });
+            });
+        }
+    }
+
+    /// 조합 중인 글자를 커서 위치부터 그린다. 셀 그리드에 맞춰야 하므로 글자마다
+    /// 폭(한글·한자·가나는 2셀)을 계산해 진행한다 — 비례 배치로 그리면 확정된
+    /// 뒤 셸이 그리는 위치와 어긋난다.
+    ///
+    /// 조합 중임을 알리기 위해 밑줄을 긋는다(터미널·에디터 공통 관례).
+    fn draw_preedit(&self, painter: &egui::Painter, start: Pos2, cell: Vec2, clip: Rect) {
+        use unicode_width::UnicodeWidthChar;
+
+        let bg = Color32::from_rgb(0x28, 0x2c, 0x34);
+        let fg = Color32::from_rgb(0xff, 0xff, 0xff);
+        let mut x = start.x;
+        for c in self.preedit.chars() {
+            let cols = c.width().unwrap_or(1).max(1) as f32;
+            let w = cell.x * cols;
+            if x + w > clip.right() {
+                break; // 오른쪽 끝을 넘으면 자른다(줄바꿈 처리는 범위 밖)
+            }
+            let r = Rect::from_min_size(Pos2::new(x, start.y), Vec2::new(w, cell.y));
+            painter.rect_filled(r, 0.0, bg);
+            painter.text(
+                Pos2::new(x, start.y),
+                egui::Align2::LEFT_TOP,
+                c,
+                self.font_id.clone(),
+                fg,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(x, start.y + cell.y - 1.0),
+                    Pos2::new(x + w, start.y + cell.y - 1.0),
+                ],
+                egui::Stroke::new(1.5, fg),
+            );
+            x += w;
         }
     }
 }
@@ -906,20 +990,33 @@ mod tests {
             )
         }
 
-        /// 화면에서 주어진 텍스트가 있는 뷰포트 행을 찾는다.
-        fn find_row(&self, needle: &str) -> Option<usize> {
+        /// 화면 각 행의 텍스트. 렌더러와 똑같이 **와이드 문자 뒤의 스페이서 셀을
+        /// 건너뛴다** — 안 그러면 한글이 "한 글"처럼 사이에 공백이 낀 채로 나와서
+        /// 실제 화면과 다른 것을 검사하게 된다(실측으로 겪음).
+        fn screen_lines(&self) -> Vec<String> {
             use alacritty_terminal::grid::Dimensions;
             let content = self.session.term.renderable_content();
             let offset = content.display_offset as i32;
             let rows = self.session.term.screen_lines();
             let mut lines = vec![String::new(); rows];
             for indexed in content.display_iter {
+                let flags = indexed.cell.flags;
+                if flags.contains(Flags::WIDE_CHAR_SPACER)
+                    || flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
                 let l = indexed.point.line.0 + offset;
                 if l >= 0 && (l as usize) < rows {
                     lines[l as usize].push(indexed.cell.c);
                 }
             }
-            lines.iter().position(|l| l.contains(needle))
+            lines
+        }
+
+        /// 화면에서 주어진 텍스트가 있는 뷰포트 행을 찾는다.
+        fn find_row(&self, needle: &str) -> Option<usize> {
+            self.screen_lines().iter().position(|l| l.contains(needle))
         }
 
         /// 화면에 `needle`이 나타날 때까지 프레임을 돌리며 기다린다(최대 ~4초).
@@ -936,18 +1033,7 @@ mod tests {
         }
 
         fn dump_screen(&self) -> String {
-            use alacritty_terminal::grid::Dimensions;
-            let content = self.session.term.renderable_content();
-            let offset = content.display_offset as i32;
-            let rows = self.session.term.screen_lines();
-            let mut lines = vec![String::new(); rows];
-            for indexed in content.display_iter {
-                let l = indexed.point.line.0 + offset;
-                if l >= 0 && (l as usize) < rows {
-                    lines[l as usize].push(indexed.cell.c);
-                }
-            }
-            lines
+            self.screen_lines()
                 .iter()
                 .map(|l| l.trim_end())
                 .filter(|l| !l.is_empty())
@@ -985,6 +1071,26 @@ mod tests {
                     modifiers: egui::Modifiers::NONE,
                 });
             });
+        }
+
+        /// IME 조합 이벤트를 한 프레임에 넣는다.
+        fn send_ime(&mut self, event: egui::ImeEvent) {
+            self.run_frames(1, |i| i.events.push(egui::Event::Ime(event.clone())));
+        }
+
+        /// 이번 프레임의 `platform_output.ime`(IME 후보창 위치 통보)를 돌려준다.
+        fn ime_output(&mut self) -> Option<egui::output::IMEOutput> {
+            self.session.pump();
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(self.rect);
+            let widget = &mut self.widget;
+            let session = &mut self.session;
+            let out = self.ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| widget.show(ui, session));
+            });
+            out.platform_output.ime
         }
 
         fn press_ctrl_c(&mut self) -> Option<String> {
@@ -1137,6 +1243,92 @@ mod tests {
         assert!(
             h.session.term.selection.is_none(),
             "타이핑했는데 선택이 안 풀림"
+        );
+    }
+
+    // ---- DEV-012: IME 조합 입력 ----
+
+    /// DEV-012 핵심: **조합 중인 글자는 셸로 새어나가면 안 된다.** 새어나가면
+    /// 한글 자모가 하나씩 셸에 들어가 명령이 깨진다("ㅎ", "하", "한" 이 순서대로
+    /// 전부 입력되는 꼴). 확정(Commit) 시점에만 보내야 한다.
+    #[test]
+    fn ime_preedit_is_not_sent_to_shell_until_commit() {
+        let mut h = SelectionHarness::new();
+
+        // 한글 "한글"을 치는 동안 IME가 보내는 중간 상태들.
+        for step in ["ㅎ", "하", "한", "한ㄱ", "한그", "한글"] {
+            h.send_ime(egui::ImeEvent::Preedit {
+                text: step.to_string(),
+                active_range_chars: None,
+            });
+            assert_eq!(
+                h.widget.preedit(),
+                step,
+                "조합 중인 글자가 위젯 상태에 반영되지 않음"
+            );
+        }
+        // 셸이 조금이라도 반응할 시간을 준다 — 새어나갔다면 여기서 화면에 찍힌다.
+        h.run_frames(40, |_| {});
+
+        let during = h.dump_screen();
+        println!("=== 조합 중 화면 ===\n{during}");
+        assert!(
+            !during.contains('ㅎ') && !during.contains('하') && !during.contains('한'),
+            "조합 중인 글자가 셸로 새어나가 화면에 찍힘 — PTY로 보내면 안 된다:\n{during}"
+        );
+
+        // 확정 — 이제서야 셸로 간다.
+        h.send_ime(egui::ImeEvent::Commit("한글".to_string()));
+        assert_eq!(h.widget.preedit(), "", "확정했는데 조합 상태가 안 지워짐");
+
+        assert!(
+            h.wait_for_row("한글"),
+            "확정한 글자가 셸에 전달되지 않음:\n{}",
+            h.dump_screen()
+        );
+    }
+
+    /// 빈 Preedit은 "조합이 취소·종료됐다"는 뜻이다(Esc 등). 상태가 지워져야
+    /// 화면에 조합 글자가 남지 않는다.
+    #[test]
+    fn empty_preedit_clears_composition() {
+        let mut h = SelectionHarness::new();
+
+        h.send_ime(egui::ImeEvent::Preedit {
+            text: "한".to_string(),
+            active_range_chars: None,
+        });
+        assert_eq!(h.widget.preedit(), "한");
+
+        h.send_ime(egui::ImeEvent::Preedit {
+            text: String::new(),
+            active_range_chars: None,
+        });
+        assert_eq!(h.widget.preedit(), "", "빈 Preedit인데 조합 상태가 남음");
+    }
+
+    /// IME 후보창이 커서를 따라오려면 매 프레임 커서 좌표를 통보해야 한다.
+    /// 이 값을 안 내보내면 egui-winit이 창의 IME를 켜지 않아 **조합 이벤트 자체가
+    /// 오지 않는다** — 즉 이게 없으면 한글 입력이 통째로 안 된다.
+    #[test]
+    fn ime_cursor_area_is_reported_for_candidate_window() {
+        let mut h = SelectionHarness::new();
+        let ime = h.ime_output().expect("IME 좌표를 통보하지 않음 — 한글 입력이 아예 안 된다");
+
+        println!("IME rect={:?} cursor_rect={:?}", ime.rect, ime.cursor_rect);
+        assert!(
+            h.rect.contains_rect(ime.cursor_rect),
+            "커서 좌표가 터미널 영역 밖: cursor_rect={:?}, terminal={:?}",
+            ime.cursor_rect,
+            h.rect
+        );
+        let cell = h.cell_size();
+        assert!(
+            (ime.cursor_rect.width() - cell.x).abs() < 0.5
+                && (ime.cursor_rect.height() - cell.y).abs() < 0.5,
+            "커서 좌표가 셀 한 칸 크기가 아님: {:?} vs cell {:?}",
+            ime.cursor_rect.size(),
+            cell
         );
     }
 

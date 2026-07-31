@@ -9,5 +9,9 @@ eframe = "0.35.0"
 egui = "0.35.0"
 open = { version = "5.4.0", features = ["shellexecute-on-windows"] }
 syncshell-core = { path = "../syncshell-core" }
+# IME 조합 중인 글자를 셀 그리드 위에 그리려면 글자별 폭(한글·한자·가나는 2셀)이
+# 필요하다(DEV-012). cjk 피처는 애매한 폭(Ambiguous) 문자를 동아시아 관례대로
+# 2로 치는 옵션 — 터미널이 그렇게 렌더링한다.
+unicode-width = { version = "0.2", features = ["cjk"] }
 fontdb = "0.23"
 ttf-parser = "0.25"

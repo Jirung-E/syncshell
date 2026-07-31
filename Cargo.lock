@@ -3413,6 +3413,7 @@ dependencies = [
  "open",
  "syncshell-core",
  "ttf-parser",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
