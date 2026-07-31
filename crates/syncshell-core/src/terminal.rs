@@ -252,6 +252,27 @@ impl TerminalSession {
         self.pending_user_input
     }
 
+    /// Ctrl+C 처리. 두 경로를 **모두** 태워야 실제 터미널처럼 동작한다(BUG-001):
+    ///
+    /// - `0x03` 바이트: 셸이 프롬프트에서 줄을 읽고 있을 때 그 줄을 취소한다
+    ///   (PSReadLine이 `^C`를 찍는다). 콘솔 이벤트로는 이게 안 된다.
+    /// - 콘솔 `CTRL_C_EVENT`: 실행 중인 명령을 끊는다. 0x03으로는 이게 안 된다 —
+    ///   명령 실행 중엔 셸이 stdin을 읽지 않기 때문(`pty.rs::send_interrupt` 참고).
+    ///
+    /// 콘솔 이벤트 전송이 실패해도 0x03은 이미 나갔으므로 줄 취소는 계속 동작한다 —
+    /// 그래서 실패를 치명적으로 다루지 않고 삼킨다.
+    pub fn send_interrupt(&mut self) -> Result<()> {
+        self.pending_user_input = false;
+        self.pty.write(&[0x03])?;
+        let _ = self.pty.send_interrupt();
+        Ok(())
+    }
+
+    /// 셸 프로세스의 PID(진단·인터럽트 경로 확인용).
+    pub fn child_process_id(&self) -> Option<u32> {
+        self.pty.child_process_id()
+    }
+
     /// 화면 내용이 바뀔 때마다 증가하는 값. 값이 지난번과 같으면 그리드 내용도
     /// 그대로라는 뜻이므로, 화면 전체를 훑는 작업을 통째로 건너뛸 수 있다.
     pub fn content_version(&self) -> u64 {

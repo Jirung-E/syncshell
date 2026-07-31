@@ -11,3 +11,12 @@ notify-debouncer-mini = "0.7"
 # 휴지통 이동 — SHFileOperation/IFileOperation 직접 호출 금지 방침(DEV-008)에 따라
 # Windows 휴지통·macOS 휴지통·Linux XDG trash를 한 API로 덮는 크레이트를 쓴다.
 trash = "5"
+
+[target.'cfg(windows)'.dependencies]
+# 실행 중인 명령에 Ctrl+C를 전달하려면 콘솔 CTRL_C_EVENT가 필요하다 —
+# PTY에 0x03을 써넣는 것만으로는 안 된다는 걸 실측으로 확인했다(BUG-001).
+# 크로스플랫폼 대체재가 없는 영역이라 여기서만 플랫폼 API를 직접 부른다.
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
