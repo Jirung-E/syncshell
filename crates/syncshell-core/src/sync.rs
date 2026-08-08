@@ -83,17 +83,19 @@ mod tests {
 
     #[test]
     fn navigating_into_child_folder_uses_relative_name() {
+        // 슬래시 경로를 쓴다 — 백슬래시는 Windows에서만 구분자로 인식되어
+        // parent()/file_name() 계산이 유닉스에서 깨진다.
         let mut sync = SyncState::new();
-        let _ = sync.user_navigated(PathBuf::from(r"C:\Users\User"));
-        let cmd = sync.user_navigated(PathBuf::from(r"C:\Users\User\Documents"));
+        let _ = sync.user_navigated(PathBuf::from("/Users/User"));
+        let cmd = sync.user_navigated(PathBuf::from("/Users/User/Documents"));
         assert_eq!(cmd, "cd \"Documents\"\r");
     }
 
     #[test]
     fn navigating_to_parent_uses_dotdot() {
         let mut sync = SyncState::new();
-        let _ = sync.user_navigated(PathBuf::from(r"C:\Users\User\Documents"));
-        let cmd = sync.user_navigated(PathBuf::from(r"C:\Users\User"));
+        let _ = sync.user_navigated(PathBuf::from("/Users/User/Documents"));
+        let cmd = sync.user_navigated(PathBuf::from("/Users/User"));
         assert_eq!(cmd, "cd ..\r");
     }
 

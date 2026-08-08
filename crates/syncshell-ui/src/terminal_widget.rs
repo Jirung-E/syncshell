@@ -1,4 +1,4 @@
-use crate::ansi_color::{resolve_bg, resolve_fg, DEFAULT_BG};
+use crate::ansi_color::{resolve_bg, resolve_fg_bold_aware, DEFAULT_BG};
 use crate::font_fallback::FontFallback;
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::term::cell::Flags;
@@ -7,6 +7,16 @@ use syncshell_core::terminal::TerminalSession;
 
 pub struct TerminalWidget {
     font_id: FontId,
+    /// BOLD 셀을 그릴 실제 굵은 weight 폰트(있으면) — `install_fonts`가 채운다.
+    /// 시스템에 진짜 굵은 face가 없으면 `None`으로 남고, 그때는 렌더링 루프가
+    /// `font_id`(일반)로 그리고 색만 밝게 표현하는 걸로 대체한다
+    /// (`ansi_color::resolve_fg_bold_aware`).
+    /// **알려진 한계**: 코드포인트 폴백(`ensure_covers`)은 `font_id`(일반)
+    /// family에만 동적으로 폰트를 추가한다. 이 `bold_font_id` family는 그
+    /// 폴백 체인을 안 물려받으므로, 굵은 한글/이모지처럼 굵은 폰트 자체에는
+    /// 없는 글자는 두부로 보일 수 있다(굵은 라틴 문자는 정상). 실사용에서
+    /// 문제되면 별도로 다룰 것.
+    bold_font_id: Option<FontId>,
     fallback: FontFallback,
     /// 폰트 폴백 사전 스캔을 마지막으로 돌렸을 때의 화면 상태
     /// (내용 버전, 스크롤 위치, 열, 행). 이게 그대로면 보이는 글자도 그대로라
@@ -25,6 +35,7 @@ impl TerminalWidget {
     pub fn new() -> Self {
         Self {
             font_id: FontId::monospace(16.0),
+            bold_font_id: None,
             fallback: FontFallback::new(),
             last_scan_key: None,
             scans_run: 0,
@@ -35,12 +46,15 @@ impl TerminalWidget {
     /// 사전 스캔을 실제로 돌린 누적 횟수 — 테스트에서 "안 바뀐 프레임은
     /// 건너뛰는지" 확인하는 용도.
     /// 지금 IME로 조합 중인 글자(없으면 빈 문자열).
-    #[cfg(test)]
+    // 지금 이 값을 쓰는 테스트가 전부 실제 PowerShell 세션을 필요로 해서
+    // windows-only로 게이팅돼 있다(cargo test --workspace 참고) — 그래서
+    // 다른 플랫폼에서는 "쓰이지 않는 메서드"로 보인다.
+    #[cfg(all(test, windows))]
     pub fn preedit(&self) -> &str {
         &self.preedit
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub fn scans_run(&self) -> u64 {
         self.scans_run
     }
@@ -50,6 +64,8 @@ impl TerminalWidget {
     /// 프레임 알아서 처리한다 — `font_fallback.rs` 참고.
     pub fn install_fonts(&mut self, ctx: &egui::Context) {
         self.fallback.install_primary(ctx);
+        self.bold_font_id =
+            self.fallback.bold_monospace_family().map(|family| FontId { size: self.font_id.size, family });
     }
 
     /// 셀 크기를 측정하고, 그리드가 몇 열x몇 행 들어가는지 계산해 반환한다
@@ -355,18 +371,25 @@ impl TerminalWidget {
             // 그 위의 글자색에 따라 안 보이는 조합이 생기는데, 반전은 원래 대비를
             // 그대로 유지해서 어떤 배색에서도 읽힌다.
             let selected = selection.is_some_and(|s| s.contains(point));
-            let (bg_color, fg_color) = if selected {
-                (resolve_fg(fg), resolve_bg(bg))
-            } else {
-                (resolve_bg(bg), resolve_fg(fg))
-            };
+            // BOLD는 일반(0-7) ANSI 색을 밝은(8-15) 계열로 승격해서도 표현한다
+            // (ansi_color.rs 참고, 대부분의 터미널 관례) — 배경색 자체(`bg`)에는
+            // 적용하지 않는다. 색만으로는 부족하다는 실사용 피드백("굵은 글씨가
+            // 제대로 표시되지 않음")을 받고, 시스템에서 실제 굵은 weight 폰트를
+            // 찾았으면(`bold_font_id`) 그 폰트로 그려서 진짜 굵은 획으로도
+            // 보이게 한다 — 없으면(시스템에 굵은 face 자체가 없는 폰트) 기존
+            // 대로 색만 밝게.
+            let bold = flags.contains(Flags::BOLD);
+            let bright_fg = resolve_fg_bold_aware(fg, bold);
+            let (bg_color, fg_color) = if selected { (bright_fg, resolve_bg(bg)) } else { (resolve_bg(bg), bright_fg) };
+            let glyph_font_id =
+                if bold { self.bold_font_id.clone().unwrap_or_else(|| self.font_id.clone()) } else { self.font_id.clone() };
 
             if bg_color != DEFAULT_BG {
                 painter.rect_filled(Rect::from_min_size(Pos2::new(x, y), Vec2::new(width, cell.y)), 0.0, bg_color);
             }
 
             if c != ' ' && c != '\0' {
-                painter.text(Pos2::new(x, y), egui::Align2::LEFT_TOP, c, self.font_id.clone(), fg_color);
+                painter.text(Pos2::new(x, y), egui::Align2::LEFT_TOP, c, glyph_font_id, fg_color);
             }
         }
 
@@ -561,6 +584,7 @@ mod tests {
     /// 포함)로 재현한다. 별도 헤드리스 예제(wrap_check)에서는 alacritty_terminal
     /// 모델 자체는 wrap이 정상 동작함을 이미 확인했다 — 이 테스트는 "매 프레임
     /// 실제 위젯 코드가 resize를 반복 호출하는 것"이 문제를 만드는지를 본다.
+    #[cfg(windows)]
     #[test]
     fn realistic_frame_loop_keeps_stable_cols_and_wraps_wide_output() {
         use alacritty_terminal::grid::Dimensions;
@@ -647,6 +671,7 @@ mod tests {
     /// 신경 쓰다 아예 빠져서 무시되고 있었다 — 실제 프로덕션 위젯 코드로 재현.
     /// 여러 줄(내부 개행 포함)을 붙여넣었을 때 \n이 아니라 \r로 정규화되어 각 줄이
     /// 제대로 명령으로 실행되는지까지 실제 PowerShell로 확인한다.
+    #[cfg(windows)]
     #[test]
     fn pasted_multiline_text_executes_each_line() {
         let ctx = egui::Context::default();
@@ -691,6 +716,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     fn full_screen_text(session: &TerminalSession) -> String {
         use alacritty_terminal::grid::Dimensions;
         let content = session.term.renderable_content();
@@ -712,6 +738,7 @@ mod tests {
     /// 위젯 코드(PageUp 처리 포함)로 스크롤백을 위로 넘겨서 옛날 내용이 실제로
     /// 보이는지, 방향이 올바른지(PageUp이 더 오래된/작은 번호 쪽을 보여주는지)
     /// 확인한다.
+    #[cfg(windows)]
     #[test]
     fn pageup_reveals_older_scrollback_content() {
         let ctx = egui::Context::default();
@@ -807,6 +834,7 @@ mod tests {
     /// 폰트 폴백 사전 스캔이 매 프레임 도는 게 여기 영향을 주는지도 같이 본다 —
     /// 이미 해결된 글자만 있으면 `ensure_covers`가 false를 돌려줘서
     /// `request_repaint()`를 부르지 않아야 한다.
+    #[cfg(windows)]
     #[test]
     fn idle_frames_do_not_request_continuous_repaint() {
         let ctx = egui::Context::default();
@@ -862,6 +890,7 @@ mod tests {
     ///
     /// 벽시계 시간이 아니라 "스캔을 실제로 몇 번 돌렸는지"로 검증한다
     /// (디버그/릴리스 빌드나 머신 부하에 흔들리지 않게).
+    #[cfg(windows)]
     #[test]
     fn font_scan_is_skipped_when_screen_content_unchanged() {
         let ctx = egui::Context::default();
@@ -925,6 +954,7 @@ mod tests {
 
     /// 선택·복사 테스트용 하네스. 실제 PowerShell 세션 위에서 진짜 위젯 코드를
     /// 돌리고, 합성 마우스/키 이벤트를 넣어 결과를 읽는다.
+    #[cfg(windows)]
     struct SelectionHarness {
         ctx: egui::Context,
         widget: TerminalWidget,
@@ -932,6 +962,7 @@ mod tests {
         rect: egui::Rect,
     }
 
+    #[cfg(windows)]
     impl SelectionHarness {
         fn new() -> Self {
             let ctx = egui::Context::default();
@@ -1108,6 +1139,7 @@ mod tests {
 
     /// DEV-012 핵심: 드래그로 고른 영역이 실제로 선택되고, Ctrl+C로 그 텍스트가
     /// 클립보드로 나가는지 — 실제 PowerShell 출력 위에서 프로덕션 경로로 확인한다.
+    #[cfg(windows)]
     #[test]
     fn drag_selection_then_ctrl_c_copies_selected_text() {
         let mut h = SelectionHarness::new();
@@ -1177,6 +1209,7 @@ mod tests {
     /// ```text
     /// cargo test -p syncshell-ui -- --ignored --test-threads=1
     /// ```
+    #[cfg(windows)]
     #[test]
     #[ignore = "콘솔 조작이 프로세스 전역이라 병렬 테스트를 깨뜨림 — 단독 실행할 것"]
     fn ctrl_c_without_selection_sends_interrupt_instead_of_copying() {
@@ -1226,6 +1259,7 @@ mod tests {
 
     /// 타이핑하면 선택이 풀려야 한다 — 선택해둔 채로 명령을 계속 치면 화면이
     /// 반전된 채 남아 헷갈린다(일반 터미널과 같은 동작).
+    #[cfg(windows)]
     #[test]
     fn typing_clears_selection() {
         let mut h = SelectionHarness::new();
@@ -1251,6 +1285,7 @@ mod tests {
     /// DEV-012 핵심: **조합 중인 글자는 셸로 새어나가면 안 된다.** 새어나가면
     /// 한글 자모가 하나씩 셸에 들어가 명령이 깨진다("ㅎ", "하", "한" 이 순서대로
     /// 전부 입력되는 꼴). 확정(Commit) 시점에만 보내야 한다.
+    #[cfg(windows)]
     #[test]
     fn ime_preedit_is_not_sent_to_shell_until_commit() {
         let mut h = SelectionHarness::new();
@@ -1290,6 +1325,7 @@ mod tests {
 
     /// 빈 Preedit은 "조합이 취소·종료됐다"는 뜻이다(Esc 등). 상태가 지워져야
     /// 화면에 조합 글자가 남지 않는다.
+    #[cfg(windows)]
     #[test]
     fn empty_preedit_clears_composition() {
         let mut h = SelectionHarness::new();
@@ -1310,6 +1346,7 @@ mod tests {
     /// IME 후보창이 커서를 따라오려면 매 프레임 커서 좌표를 통보해야 한다.
     /// 이 값을 안 내보내면 egui-winit이 창의 IME를 켜지 않아 **조합 이벤트 자체가
     /// 오지 않는다** — 즉 이게 없으면 한글 입력이 통째로 안 된다.
+    #[cfg(windows)]
     #[test]
     fn ime_cursor_area_is_reported_for_candidate_window() {
         let mut h = SelectionHarness::new();
@@ -1335,6 +1372,7 @@ mod tests {
     /// 화면 좌표 → 셀 좌표 변환이 스크롤백(display_offset)을 반영하는지.
     /// 렌더 루프는 반대로 display_offset을 더하므로(DEV-003), 여기서 빼지 않으면
     /// 스크롤백을 보고 있을 때 엉뚱한 줄이 선택된다.
+    #[cfg(windows)]
     #[test]
     fn pos_to_cell_accounts_for_scrollback_offset() {
         let mut h = SelectionHarness::new();

@@ -11,6 +11,17 @@ notify-debouncer-mini = "0.7"
 # 휴지통 이동 — SHFileOperation/IFileOperation 직접 호출 금지 방침(DEV-008)에 따라
 # Windows 휴지통·macOS 휴지통·Linux XDG trash를 한 API로 덮는 크레이트를 쓴다.
 trash = "5"
+# 세션/설정 저장(DEV-010) — config.toml/state.toml 직렬화.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[target.'cfg(unix)'.dependencies]
+# alacritty_terminal이 쓰는 rustix-openpty가 유닉스 타깃에서 rustix 0.38을
+# default-features = false로 당겨와 "std" 피처가 빠지는 바람에, rustix의
+# OwnedFd가 std::os::fd::OwnedFd와 다른 타입으로 컴파일되어 macOS 빌드가
+# 깨진다. 같은 버전(0.38)을 여기서 std 피처 포함으로 직접 선언해 피처
+# unification으로 강제한다 — 업스트림(rustix-openpty) 쪽 버그의 로컬 우회.
+rustix = { version = "0.38", features = ["std"] }
 
 [target.'cfg(windows)'.dependencies]
 # 실행 중인 명령에 Ctrl+C를 전달하려면 콘솔 CTRL_C_EVENT가 필요하다 —
@@ -19,4 +30,7 @@ trash = "5"
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_System_Console",
+    # ~/.syncshell 폴더가 "." 로 시작해도 Windows에서는 자동으로 숨겨지지 않는다
+    # (숨김 속성은 이름과 별개) — DEV-010: SetFileAttributesW로 명시적으로 숨김.
+    "Win32_Storage_FileSystem",
 ] }

@@ -1,4 +1,4 @@
-use crate::osc7::{powershell_injection_script, Osc7Scanner};
+use crate::osc7::{powershell_injection_script, zsh_injection_script, Osc7Scanner};
 use crate::pty::Pty;
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions;
@@ -65,6 +65,22 @@ pub struct TerminalSession {
     /// `write_keyboard_input()`으로 들어온 실제 사용자 타이핑만 이 플래그를
     /// 갱신한다 — 동기화가 주입하는 `write_input()` 호출은 관여하지 않는다.
     pending_user_input: bool,
+    /// 셸이 지금 명령을 실행 중인지 — Enter로 (빈 줄이 아닌) 명령을 제출한
+    /// 순간부터 다음 프롬프트가 뜨기 전까지 true. `pending_user_input`과는
+    /// 다른 신호다: Enter를 누르는 순간 `pending_user_input`은 곧바로 false가
+    /// 되지만(더 이상 "제출 안 한 줄"이 아니므로), 셸은 그 명령을 아직 실행
+    /// 중일 수 있다. 이 사이 구간에 cd를 곧장 주입하면 그 바이트가 PTY 입력
+    /// 큐에 쌓였다가, 지금 실행 중인 프로그램이 stdin을 읽는 종류(REPL·페이저·
+    /// 대화형 프롬프트 등)라면 엉뚱하게 그 프로그램에 들어가버릴 수 있다 —
+    /// 그래서 cd 주입은 이 플래그도 확인해서 미뤄야 한다.
+    command_running: bool,
+    /// 이 셸이 Ctrl+A(0x01)를 "줄 맨 앞으로 이동"(이맥스 기본 키바인딩 —
+    /// bash/zsh의 readline/zle 기본값)으로 해석하는지. true인 셸에서만 타이핑
+    /// 중인 줄 앞에 cd를 안전하게 끼워 넣을 수 있다 — PowerShell(PSReadLine
+    /// 기본 "Windows" 모드)은 Ctrl+A가 "전체 선택"이라, 그 상태에서 새로
+    /// 타이핑하면 선택된(=사용자가 치던 전체 내용) 걸 지워버린다. 실측 확인
+    /// (zsh: `\x01` 보낸 뒤 타이핑하면 정확히 줄 앞에 끼워짐).
+    supports_line_prefix_insert: bool,
     /// 터미널 화면 내용이 바뀔 때마다(= PTY 바이트를 실제로 처리할 때마다)
     /// 증가한다. UI가 "지난번 본 뒤로 화면이 바뀌었나"를 O(1)로 판단하는 데 쓴다 —
     /// 예: 폰트 폴백 사전 스캔은 화면 전체를 훑는 비용(8000셀 기준 프레임당
@@ -81,23 +97,53 @@ pub struct TerminalSession {
     rows: u16,
 }
 
+/// 셸 실행 파일 이름만으로 종류를 가른다(전체 경로가 와도 마지막 조각만 본다 —
+/// 예: "/opt/homebrew/bin/zsh"도 "zsh"로 인식). 인자 선택과 초기화 스크립트 선택
+/// 둘 다 여기 기준을 공유한다.
+fn shell_basename(shell: &str) -> &str {
+    std::path::Path::new(shell)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(shell)
+}
+
+/// 플랫폼 기본 셸의 실행 파일 경로. Windows는 항상 PowerShell, 그 외에는 로그인
+/// 셸(`$SHELL`)을 따르고 없으면 zsh로 폴백한다(macOS 10.15+ 기본 로그인 셸).
+pub fn default_shell() -> String {
+    #[cfg(windows)]
+    {
+        "powershell.exe".to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
+    }
+}
+
 impl TerminalSession {
     pub fn spawn(shell: &str, cols: u16, rows: u16, on_data: impl Fn() + Send + Sync + 'static) -> Result<Self> {
         let on_data: Arc<dyn Fn() + Send + Sync> = Arc::new(on_data);
+        let name = shell_basename(shell);
+        let is_powershell = name.eq_ignore_ascii_case("powershell.exe");
+        let is_zsh = name.eq_ignore_ascii_case("zsh");
+
         // -NoLogo: 저작권 배너를 안 띄운다. 배너 + 뒤이어 "타이핑되듯" 들어가는
         // 초기화 스크립트(아래)가 겹쳐 보여서 첫 실행 화면이 뭔가 잘못된 것처럼
         // (예: "엔터가 이미 쳐진 것 같다") 보였던 것의 원인 중 하나였다(TR-006 피드백).
-        let args: &[&str] = if shell.eq_ignore_ascii_case("powershell.exe") {
-            &["-NoLogo"]
-        } else {
-            &[]
-        };
+        let args: &[&str] = if is_powershell { &["-NoLogo"] } else { &[] };
         let (mut pty, mut reader) = Pty::spawn(shell, args, cols, rows)?;
 
         // DEV-004 결론: $PROFILE은 건드리지 않고, PTY 기동 직후 지연 없이
-        // "타이핑하듯" 스크립트를 써넣는다. PowerShell 외 셸은 예광탄 범위 밖(생략).
-        if shell.eq_ignore_ascii_case("powershell.exe") {
-            let mut script = powershell_injection_script().as_bytes().to_vec();
+        // "타이핑하듯" 스크립트를 써넣는다. PowerShell/zsh 외 셸은 예광탄 범위 밖(생략).
+        let injection_script = if is_powershell {
+            Some(powershell_injection_script())
+        } else if is_zsh {
+            Some(zsh_injection_script())
+        } else {
+            None
+        };
+        if let Some(script) = injection_script {
+            let mut script = script.as_bytes().to_vec();
             // 실제 키보드 Enter는 \r만 보낸다(terminal_widget.rs 참고) — 여기서 \r\n을
             // 쓰면 \r로 제출된 직후 남는 \n이 빈 줄에서 또 한 번의 Enter처럼 처리돼
             // PSReadLine이 헷갈려하는 것으로 확인됨(스폰 직후 화면에 ">>" 연속줄
@@ -145,6 +191,10 @@ impl TerminalSession {
             cwd_dirty: false,
             exited: false,
             pending_user_input: false,
+            command_running: false,
+            // 지금은 zsh만 해당(이맥스 기본 키바인딩). bash를 나중에 정식
+            // 지원하게 되면 마찬가지로 true여야 한다(같은 readline 계열).
+            supports_line_prefix_insert: is_zsh,
             content_version: 0,
             processor: Processor::new(),
             osc7: Osc7Scanner::new(),
@@ -188,6 +238,9 @@ impl TerminalSession {
                 // 그래서 여기서 pending_user_input도 같이 내린다 — Enter가 아닌
                 // 다른 방식(Ctrl+C 등)으로 줄이 끝났을 때도 놓치지 않기 위함.
                 self.pending_user_input = false;
+                // 새 프롬프트가 떴다 = 셸이 다시 입력을 기다리는 상태 = 방금
+                // 실행 중이던 명령(있었다면)이 끝났다는 뜻이다.
+                self.command_running = false;
                 self.pending_cwd = Some((latest, Instant::now()));
                 let on_data = self.on_data.clone();
                 thread::spawn(move || {
@@ -240,8 +293,13 @@ impl TerminalSession {
 
     /// 실제 키보드 입력 경로(`TerminalWidget::show`)에서만 호출한다. 순수 Enter(`\r`
     /// 단독)가 아니면 "아직 제출 안 한 입력이 있을 수 있다"로 표시하고, 순수
-    /// Enter면 제출됐다고 보고 플래그를 내린다.
+    /// Enter면 제출됐다고 보고 플래그를 내린다 — 그리고 셸이 그 명령을 실행하기
+    /// 시작했다고 낙관적으로 표시한다(`command_running`, 실제 종료는 다음
+    /// OSC7 프롬프트로 확인).
     pub fn write_keyboard_input(&mut self, data: &[u8]) -> Result<()> {
+        if data == b"\r" {
+            self.command_running = true;
+        }
         self.pending_user_input = data != b"\r";
         self.pty.write(data)
     }
@@ -250,6 +308,19 @@ impl TerminalSession {
     /// 있는지. true면 호출부는 주입을 미루고 이 값이 false가 될 때까지 기다려야 한다.
     pub fn has_pending_user_input(&self) -> bool {
         self.pending_user_input
+    }
+
+    /// 셸이 지금 명령을 실행 중인지(`command_running` 필드 설명 참고). cd 주입은
+    /// 이것도 확인해야 한다 — 안 그러면 그 바이트가 지금 실행 중인 프로그램에
+    /// (stdin을 읽는 종류라면) 잘못 들어갈 수 있다.
+    pub fn is_command_running(&self) -> bool {
+        self.command_running
+    }
+
+    /// `supports_line_prefix_insert` 필드 설명 참고 — Ctrl+A로 안전하게 줄 맨
+    /// 앞에 텍스트를 끼워 넣을 수 있는 셸인지.
+    pub fn supports_line_prefix_insert(&self) -> bool {
+        self.supports_line_prefix_insert
     }
 
     /// Ctrl+C 처리. 두 경로를 **모두** 태워야 실제 터미널처럼 동작한다(BUG-001):
@@ -303,5 +374,78 @@ impl TerminalSession {
         };
         self.term.resize(size);
         let _ = self.pty.resize(cols, rows);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_basename_strips_path_and_keeps_only_file_name() {
+        assert_eq!(shell_basename("zsh"), "zsh");
+        assert_eq!(shell_basename("/bin/zsh"), "zsh");
+        assert_eq!(shell_basename("/opt/homebrew/bin/zsh"), "zsh");
+        assert_eq!(shell_basename("powershell.exe"), "powershell.exe");
+    }
+
+    /// 백슬래시 경로 구분은 Windows에서만 성립한다(`std::path::Path`가 플랫폼별로
+    /// 다르게 구분자를 인식함 — 유닉스에서는 `\`가 그냥 평범한 문자다). 그래서 이
+    /// 케이스는 Windows 빌드에서만 의미가 있다.
+    #[test]
+    #[cfg(windows)]
+    fn shell_basename_strips_windows_backslash_path() {
+        assert_eq!(
+            shell_basename(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+            "powershell.exe"
+        );
+    }
+
+    fn pump_for(session: &mut TerminalSession, ms: u64) {
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        while Instant::now() < deadline {
+            session.pump();
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// 실제 zsh로 `command_running`/`pending_user_input`/`supports_line_prefix_insert`의
+    /// 전체 수명주기를 확인한다 — 지금까지는 `examples/zsh_*.rs`로만 수동 확인했고
+    /// `cargo test`로 자동 검증되는 테스트가 없었다.
+    #[test]
+    #[cfg_attr(windows, ignore = "이 테스트는 zsh 전용 — Windows에는 없음")]
+    fn zsh_session_tracks_input_and_command_state_transitions() {
+        let mut session = TerminalSession::spawn("/bin/zsh", 80, 24, || {}).expect("zsh spawn");
+        pump_for(&mut session, 700);
+
+        assert!(session.supports_line_prefix_insert(), "zsh는 줄 앞 삽입을 지원해야 함");
+        assert!(!session.is_command_running(), "시작 직후인데 명령이 실행 중이라고 나옴");
+        assert!(!session.has_pending_user_input());
+
+        // 타이핑 중(제출 전) — pending_user_input만 true, command_running은 아직 false.
+        session.write_keyboard_input(b"sleep 0.3").unwrap();
+        assert!(session.has_pending_user_input(), "타이핑했는데 pending_user_input이 안 뜸");
+        assert!(!session.is_command_running(), "제출도 안 했는데 command_running이 뜸");
+
+        // Enter로 제출 — 그 즉시 pending_user_input은 내려가고 command_running이 뜬다
+        // (write_keyboard_input 안에서 동기적으로 갱신되므로 pump() 없이도 바로 반영됨).
+        session.write_keyboard_input(b"\r").unwrap();
+        assert!(!session.has_pending_user_input(), "Enter를 눌렀는데 pending_user_input이 여전히 true");
+        assert!(session.is_command_running(), "Enter로 명령을 제출했는데 command_running이 안 뜸");
+
+        // 명령이 끝나고 새 프롬프트(OSC7)가 뜰 때까지 기다린다 — command_running이
+        // 다시 내려가야 한다.
+        pump_for(&mut session, 1200);
+        assert!(!session.is_command_running(), "명령이 끝났는데 command_running이 안 내려감");
+    }
+
+    /// `supports_line_prefix_insert`는 지금은 zsh만 true다(필드 설명 참고 —
+    /// bash는 같은 readline 계열이라 나중에 지원 대상이지만 아직은 아님).
+    #[test]
+    #[cfg_attr(windows, ignore = "이 테스트는 bash 전용 — Windows에는 없음")]
+    fn bash_does_not_support_line_prefix_insert_yet() {
+        let mut session = TerminalSession::spawn("/bin/bash", 80, 24, || {}).expect("bash spawn");
+        pump_for(&mut session, 500);
+        assert!(!session.supports_line_prefix_insert(), "지금은 zsh만 지원 대상 — bash는 아직 아님");
     }
 }

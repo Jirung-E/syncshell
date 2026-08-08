@@ -10,6 +10,11 @@ pub struct DirEntry {
     pub name: String,
     pub path: PathBuf,
     pub is_dir: bool,
+    /// 폴더는 항상 0 — 폴더 크기(하위 항목 합산)는 재귀 조회가 필요해 비싸서
+    /// 계산하지 않는다(일반 탐색기도 대개 마찬가지).
+    pub size: u64,
+    /// 못 읽으면(권한 문제, 일부 가상 파일시스템 등) `None` — 표시부는 빈칸으로 둔다.
+    pub modified: Option<std::time::SystemTime>,
 }
 
 enum FsEvent {
@@ -139,13 +144,36 @@ impl FsView {
                     for path in paths {
                         // 다른 폴더로 이미 옮겨간 뒤 도착한 옛 워처의 이벤트, 또는
                         // (이론상) 감시 대상 바로 아래가 아닌 경로는 무시한다.
-                        if path.parent() != Some(self.current_dir.as_path()) {
+                        let Some(parent) = path.parent() else { continue };
+                        if !self.matches_current_dir(parent) {
                             continue;
                         }
-                        apply_change(&mut self.entries, &path);
+                        let Some(name) = path.file_name() else { continue };
+                        // current_dir 기준으로 경로를 다시 조립한다 — macOS는 이벤트
+                        // 경로를 정규화된 실제 경로(예: /private/var/...)로 주는데,
+                        // read_dir_sorted가 채운 기존 entries의 path는 current_dir
+                        // 기준(예: /var/...)이라 문자열이 달라 apply_change의 path
+                        // 일치 비교(추가/갱신/삭제 판정)가 항상 실패했었다.
+                        let normalized = self.current_dir.join(name);
+                        apply_change(&mut self.entries, &normalized);
                     }
                 }
             }
+        }
+    }
+
+    /// 이벤트로 들어온 경로의 부모가 지금 보고 있는 디렉터리와 같은 곳인지.
+    /// macOS(FSEvents)는 심볼릭 링크를 실제 경로로 정규화해서 이벤트를 돌려준다 —
+    /// 예를 들어 `/var/...`를 감시해도 이벤트 경로는 `/private/var/...`로 온다
+    /// (`/var`가 `/private/var`의 심볼릭 링크라서). 문자열이 그대로 같으면(대부분의
+    /// 경우, 특히 Windows) 바로 통과시키고, 다를 때만 정규화해서 한 번 더 비교한다.
+    fn matches_current_dir(&self, parent: &Path) -> bool {
+        if parent == self.current_dir.as_path() {
+            return true;
+        }
+        match (parent.canonicalize(), self.current_dir.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
         }
     }
 }
@@ -162,14 +190,20 @@ fn apply_change(entries: &mut Vec<DirEntry>, path: &Path) {
                 Some(n) => n.to_string_lossy().into_owned(),
                 None => return,
             };
+            let size = if is_dir { 0 } else { meta.len() };
+            let modified = meta.modified().ok();
             if let Some(existing) = entries.iter_mut().find(|e| e.path == path) {
                 existing.is_dir = is_dir;
                 existing.name = name;
+                existing.size = size;
+                existing.modified = modified;
             } else {
                 entries.push(DirEntry {
                     name,
                     path: path.to_path_buf(),
                     is_dir,
+                    size,
+                    modified,
                 });
             }
         }
@@ -195,12 +229,17 @@ fn read_dir_sorted(path: &Path) -> std::io::Result<Vec<DirEntry>> {
             // 따라가지 않는다 — 심볼릭 링크로 된 폴더가 파일로 잘못 분류되어 탐색기에서
             // 클릭 자체가 안 되는 버그로 발견됨(TR-006 사용자 피드백: "링크 접근이 안됨").
             // path().metadata()는 기본적으로 심볼릭 링크를 따라가므로 실제 대상 타입을 본다.
-            let is_dir = entry_path.metadata().map(|m| m.is_dir()).unwrap_or(false);
+            let meta = entry_path.metadata().ok();
+            let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+            let size = meta.as_ref().map(|m| if is_dir { 0 } else { m.len() }).unwrap_or(0);
+            let modified = meta.as_ref().and_then(|m| m.modified().ok());
             let name = e.file_name().to_string_lossy().into_owned();
             DirEntry {
                 name,
                 path: entry_path,
                 is_dir,
+                size,
+                modified,
             }
         })
         .collect();
@@ -249,7 +288,12 @@ mod tests {
         std::fs::create_dir_all(&real_dir).unwrap();
         let link = base.join("link_to_target");
 
-        if std::os::windows::fs::symlink_dir(&real_dir, &link).is_err() {
+        #[cfg(windows)]
+        let symlink_result = std::os::windows::fs::symlink_dir(&real_dir, &link);
+        #[cfg(not(windows))]
+        let symlink_result = std::os::unix::fs::symlink(&real_dir, &link);
+
+        if symlink_result.is_err() {
             eprintln!("심볼릭 링크 생성 권한 없음 — 테스트 스킵 (Developer Mode 확인 필요)");
             std::fs::remove_dir_all(&base).ok();
             return;
@@ -267,6 +311,32 @@ mod tests {
     fn nonexistent_dir_returns_err() {
         let bogus = std::env::temp_dir().join("syncshell-does-not-exist-xyz");
         assert!(read_dir_sorted(&bogus).is_err());
+    }
+
+    /// DEV-005 Test plan: "접근 권한 없는 폴더 진입 시 크래시 없이 오류 표시".
+    /// `read_dir_sorted`가 패닉 없이 `Err`을 돌려주는지 — 실제 권한을 0으로 만들어서
+    /// 확인한다. `FsView::spawn_load`가 이 결과를 `FsEvent::Error`로 감싸 `error`
+    /// 필드에 담는 부분(패닉 없음)은 이 함수 자체가 패닉하지 않는 것으로 보장된다.
+    #[cfg(unix)]
+    #[test]
+    fn permission_denied_dir_returns_err_not_panic() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!("syncshell-noperm-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // root로 테스트를 돌리면(CI 컨테이너 등) 권한 검사가 아예 우회돼 성공할 수
+        // 있다 — 그 환경에서는 "권한 없음" 전제 자체가 성립하지 않으니 스킵한다.
+        let result = read_dir_sorted(&base);
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&base).ok();
+
+        if result.is_ok() {
+            eprintln!("root 등으로 실행돼 권한 검사가 우회됨 — 테스트 스킵");
+            return;
+        }
+        assert!(result.is_err(), "권한 없는 폴더인데 읽기가 성공함 — 테스트 전제가 깨짐");
     }
 
     /// 최대 3초 동안 `pump()`를 반복 호출하며 조건이 만족될 때까지 기다린다.
