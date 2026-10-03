@@ -84,6 +84,21 @@ impl Tab {
         }
     }
 
+    /// 탐색기와 터미널이 지금 같은 폴더를 보고 있는지(DEV-023 상태바·탭 점).
+    fn sync_status(&self) -> SyncStatus {
+        let Some(session) = &self.terminal else {
+            return SyncStatus::Unknown;
+        };
+        if self.pending_cd.is_some() {
+            return SyncStatus::Pending;
+        }
+        match &session.cwd {
+            None => SyncStatus::Unknown,
+            Some(cwd) if *cwd == self.fs.current_dir => SyncStatus::Synced,
+            Some(_) => SyncStatus::Pending,
+        }
+    }
+
     /// 탭 바에 보여줄 이름 — 현재 폴더의 마지막 이름(비어 있으면, 예: 드라이브
     /// 루트면 전체 경로).
     fn title(&self) -> String {
@@ -331,6 +346,27 @@ pub struct SyncShellApp {
     view_mode: ViewMode,
 }
 
+/// [`Tab::sync_status`] 참고.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncStatus {
+    /// 셸의 현재 폴더(OSC 7)와 탐색기 폴더가 같다.
+    Synced,
+    /// 한쪽이 움직였고 다른 쪽이 따라가는 중(대기 중인 cd 포함).
+    Pending,
+    /// 셸이 아직 현재 폴더를 알려오지 않았다(OSC 7 미수신, 셸 시작 실패 등).
+    Unknown,
+}
+
+impl SyncStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Synced => "동기화됨",
+            Self::Pending => "동기화 중",
+            Self::Unknown => "셸 경로 미확인",
+        }
+    }
+}
+
 /// [`SyncShellApp::panel_layout`] 참고.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum PanelLayout {
@@ -342,20 +378,19 @@ enum PanelLayout {
 }
 
 impl PanelLayout {
-    fn toggled(self) -> Self {
+    /// `state.toml`의 `[ui] layout` 값.
+    fn as_str(self) -> &'static str {
         match self {
-            Self::Side => Self::Stacked,
-            Self::Stacked => Self::Side,
+            Self::Side => "side",
+            Self::Stacked => "stacked",
         }
     }
 
-    /// 토글 버튼에 보여줄 라벨 — "지금 상태"가 아니라 "눌렀을 때 될 상태"를
-    /// 보여준다(대부분의 토글 버튼 관례 — 지금 상태를 그대로 라벨로 쓰면 눌러도
-    /// 안 바뀐 것처럼 헷갈린다).
-    fn toggle_label(self) -> &'static str {
-        match self {
-            Self::Side => "레이아웃: 상하로",
-            Self::Stacked => "레이아웃: 좌우로",
+    /// 모르는 값은 기본(좌우)으로.
+    fn parse(s: &str) -> Self {
+        match s {
+            "stacked" => Self::Stacked,
+            _ => Self::Side,
         }
     }
 }
@@ -395,7 +430,7 @@ impl SyncShellApp {
             active,
             default_shell: config.default_shell,
             last_window_rect: None,
-            panel_layout: PanelLayout::default(),
+            panel_layout: PanelLayout::parse(&state.ui.layout),
             theme,
             view_mode: ViewMode::parse(&state.ui.view),
         }
@@ -420,6 +455,7 @@ impl SyncShellApp {
             ui: syncshell_core::session::UiState {
                 theme: self.theme.as_str().to_string(),
                 view: self.view_mode.as_str().to_string(),
+                layout: self.panel_layout.as_str().to_string(),
             },
         }
     }
@@ -478,54 +514,73 @@ impl SyncShellApp {
         let mut switch_to = None;
         let mut close_index = None;
         let mut want_new_tab = false;
-        ui.horizontal(|ui| {
-            // 레이아웃 방향 토글(실사용 요청: "위|아래로도 배치할 수 있게")을
-            // 먼저 그려서 탭 바 오른쪽 끝에 고정시킨다 — 이 안에서 다시
-            // right_to_left로 그리면 오른쪽부터 채워지고, 뒤이어 그리는 탭들은
-            // (아래 left_to_right 그대로) 남은 공간을 왼쪽부터 채운다.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // right_to_left라 먼저 그린 게 맨 오른쪽 — 테마 전환이 끝에 온다.
-                let pal = self.theme.palette();
-                let picked = chrome::segmented(
-                    ui,
-                    pal,
-                    &[
-                        (chrome::Icon::Moon, "다크 모드", self.theme == ThemeMode::Dark),
-                        (chrome::Icon::Sun, "라이트 모드", self.theme == ThemeMode::Light),
-                    ],
-                );
-                match picked {
-                    Some(0) => self.set_theme(ctx, ThemeMode::Dark),
-                    Some(1) => self.set_theme(ctx, ThemeMode::Light),
-                    _ => {}
-                }
-                if ui.button(self.panel_layout.toggle_label()).clicked() {
-                    self.panel_layout = self.panel_layout.toggled();
-                }
-            });
+        let pal = self.theme.palette();
+        let row_h = ui.available_height();
 
-            // DEV-014: macOS는 투명 타이틀바(run()에서 설정) 위에 탭 바가 신호등
-            // 버튼과 같은 줄에 뜬다 — 버튼 폭만큼 왼쪽을 비워야 겹치지 않는다.
-            // 신호등은 항상 왼쪽에 고정 폭(~78px)으로 뜨므로 하드코딩 가능.
-            #[cfg(target_os = "macos")]
-            ui.add_space(78.0);
+        // DEV-014: macOS는 투명 타이틀바(run()에서 설정) 위에 탭 바가 신호등
+        // 버튼과 같은 줄에 뜬다 — 버튼 폭만큼 왼쪽을 비워야 겹치지 않는다.
+        // 신호등은 항상 왼쪽에 고정 폭(~78px)으로 뜨므로 하드코딩 가능.
+        #[cfg(target_os = "macos")]
+        ui.add_space(78.0);
 
-            for (i, tab) in self.tabs.iter().enumerate() {
-                ui.push_id(i, |ui| {
-                    let selected = i == self.active;
-                    if ui.selectable_label(selected, tab.title()).clicked() {
+        // 오른쪽 버튼 묶음(분할·테마)의 폭을 먼저 빼고 남는 폭에 탭을 그린다.
+        // 예전엔 오른쪽 묶음을 `with_layout(right_to_left)`로 먼저 그렸는데, 그게
+        // 남은 가로 폭을 전부 차지해서 뒤에 그리는 탭이 하나도 안 보였다(DEV-021
+        // 작업 중 발견).
+        const SEGMENT_W: f32 = 2.0 * 28.0 + 4.0;
+        let right_w = SEGMENT_W * 2.0 + 8.0 + ui.spacing().item_spacing.x;
+        let tabs_w = (ui.available_width() - right_w).max(0.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(tabs_w, row_h),
+            egui::Layout::left_to_right(egui::Align::Max),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let closable = self.tabs.len() > 1;
+                for (i, tab) in self.tabs.iter().enumerate() {
+                    let out = tab_card(ui, pal, i, &tab.title(), i == self.active, closable, tab.sync_status());
+                    if out.close_clicked {
+                        close_index = Some(i);
+                    } else if out.clicked {
                         switch_to = Some(i);
                     }
-                    // "✕"(U+2715)가 아니라 "×"(U+00D7) — 대부분의 일반 폰트가
-                    // U+2715는 안 갖고 있어 두부로 보이는 실사용 버그가 있었다
-                    // (file_panel.rs 상태 메시지 닫기 버튼과 같은 문제, fontdb로 실측).
-                    if self.tabs.len() > 1 && ui.small_button("×").clicked() {
-                        close_index = Some(i);
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    if chrome::icon_button(ui, pal, chrome::Icon::Plus, "새 탭 (Ctrl/Cmd+T)", 24.0).clicked() {
+                        want_new_tab = true;
                     }
                 });
+            },
+        );
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // right_to_left라 먼저 그린 게 맨 오른쪽 — 테마 전환이 끝에 온다.
+            let picked = chrome::segmented(
+                ui,
+                pal,
+                &[
+                    (chrome::Icon::Sun, "라이트 모드", self.theme == ThemeMode::Light),
+                    (chrome::Icon::Moon, "다크 모드", self.theme == ThemeMode::Dark),
+                ],
+            );
+            match picked {
+                Some(0) => self.set_theme(ctx, ThemeMode::Light),
+                Some(1) => self.set_theme(ctx, ThemeMode::Dark),
+                _ => {}
             }
-            if ui.button("+").on_hover_text("새 탭 (Ctrl/Cmd+T)").clicked() {
-                want_new_tab = true;
+            ui.add_space(8.0);
+            // 분할 모양(실사용 요청: "위|아래로도 배치할 수 있게", DEV-020).
+            let picked = chrome::segmented(
+                ui,
+                pal,
+                &[
+                    (chrome::Icon::SplitSide, "좌우 분할", self.panel_layout == PanelLayout::Side),
+                    (chrome::Icon::SplitStacked, "상하 분할", self.panel_layout == PanelLayout::Stacked),
+                ],
+            );
+            match picked {
+                Some(0) => self.panel_layout = PanelLayout::Side,
+                Some(1) => self.panel_layout = PanelLayout::Stacked,
+                _ => {}
             }
         });
 
@@ -540,6 +595,123 @@ impl SyncShellApp {
     }
 }
 
+struct TabCardOutput {
+    clicked: bool,
+    close_clicked: bool,
+}
+
+/// 탭 하나(DEV-023). 활성 탭은 탐색기 패널과 같은 바탕의 카드로 아래 패널에
+/// 이어 붙은 것처럼 보이고, 비활성 탭은 글자만 흐리게 둔다. 제목 앞 점은 동기화
+/// 상태(채워진 강조색 = 동기화됨). 닫기 버튼은 활성 탭이거나 마우스를 올렸을
+/// 때만 보인다 — 탭이 많아져도 바가 어지럽지 않게.
+fn tab_card(
+    ui: &mut egui::Ui,
+    pal: &theme::Palette,
+    index: usize,
+    title: &str,
+    active: bool,
+    closable: bool,
+    sync: SyncStatus,
+) -> TabCardOutput {
+    use egui::{pos2, vec2, Rect};
+    let font = egui::FontId::proportional(13.0);
+    let fg = if active { pal.text } else { pal.muted };
+    let mut job = egui::text::LayoutJob::single_section(title.to_owned(), egui::TextFormat::simple(font, fg));
+    job.wrap = egui::text::TextWrapping {
+        max_width: 150.0,
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    let galley = ui.painter().layout_job(job);
+
+    const PAD_L: f32 = 12.0;
+    const DOT: f32 = 6.0;
+    const CLOSE: f32 = 18.0;
+    let w = (PAD_L + DOT + 8.0 + galley.size().x + 8.0 + CLOSE + 6.0).max(120.0);
+    let h = ui.available_height() - 4.0;
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, h), egui::Sense::click());
+    let resp = resp.on_hover_text(title);
+    #[cfg(test)]
+    tests::record_tab_rect_for_test(index, rect);
+
+    let close_rect = Rect::from_center_size(pos2(rect.right() - 6.0 - CLOSE / 2.0, rect.center().y), vec2(CLOSE, CLOSE));
+    let close_resp = if closable {
+        Some(ui.interact(close_rect, ui.id().with(("tab_close", index)), egui::Sense::click()).on_hover_text("탭 닫기"))
+    } else {
+        None
+    };
+
+    let painter = ui.painter();
+    if active {
+        painter.rect(
+            rect,
+            egui::CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 },
+            pal.panel,
+            egui::Stroke::new(1.0, pal.border),
+            egui::StrokeKind::Inside,
+        );
+        // 아래 테두리는 지워서 패널과 이어 붙게 한다.
+        painter.hline(rect.x_range().shrink(1.0), rect.bottom() - 0.5, egui::Stroke::new(1.5, pal.panel));
+    } else if resp.hovered() {
+        painter.rect_filled(rect.shrink2(vec2(0.0, 3.0)), 6.0, pal.hover);
+    }
+
+    let dot_c = pos2(rect.left() + PAD_L + DOT / 2.0, rect.center().y);
+    if sync == SyncStatus::Synced {
+        painter.circle_filled(dot_c, DOT / 2.0, pal.accent);
+    } else {
+        painter.circle_stroke(dot_c, DOT / 2.0 - 0.5, egui::Stroke::new(1.0, pal.muted));
+    }
+    painter.galley(
+        pos2(dot_c.x + DOT / 2.0 + 8.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        fg,
+    );
+
+    let mut close_clicked = false;
+    if let Some(close_resp) = &close_resp {
+        if active || resp.hovered() || close_resp.hovered() {
+            chrome::paint_icon_button(ui, pal, close_rect, close_resp, chrome::Icon::Close);
+        }
+        close_clicked = close_resp.clicked();
+    }
+    TabCardOutput { clicked: resp.clicked(), close_clicked }
+}
+
+/// 하단 상태바(DEV-023): 동기화 상태 · 현재 폴더 · 항목 수.
+fn status_bar(ui: &mut egui::Ui, pal: &theme::Palette, tab: &Tab) {
+    let sync = tab.sync_status();
+    let small = egui::FontId::proportional(11.5);
+    ui.horizontal_centered(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(13.0, 13.0), egui::Sense::hover());
+        let icon_color = if sync == SyncStatus::Synced { pal.accent } else { pal.muted };
+        chrome::paint_icon(ui.painter(), icon_rect, chrome::Icon::Link, icon_color);
+        ui.label(egui::RichText::new(sync.label()).font(small.clone()).color(pal.text));
+        ui.add_space(8.0);
+        ui.add(egui::Label::new(egui::RichText::new(home_relative(&tab.fs.current_dir)).font(small.clone()).color(pal.muted)).truncate());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(egui::RichText::new(format!("{}개 항목", tab.fs.entries.len())).font(small).color(pal.muted));
+        });
+    });
+}
+
+/// 홈 폴더 아래 경로는 `~/…`로 줄여 보여준다(상태바 폭 절약, 셸 프롬프트와 같은 표기).
+fn home_relative(path: &Path) -> String {
+    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    if let Some(home) = std::env::var_os(home_var).map(PathBuf::from) {
+        if let Ok(rest) = path.strip_prefix(&home) {
+            return if rest.as_os_str().is_empty() {
+                "~".to_string()
+            } else {
+                format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display())
+            };
+        }
+    }
+    path.display().to_string()
+}
+
 /// macOS 커스텀 타이틀바(투명 titlebar 위에 탭 바가 신호등 버튼과 같은 줄에
 /// 뜸, `run()`의 macOS 전용 크롬 설정 참고)에서 탭 바가 신호등 버튼 높이보다
 /// 얇으면 버튼이 탭 바 위로 삐져나온 것처럼 겹쳐 보인다(실사용 피드백:
@@ -552,6 +724,7 @@ impl SyncShellApp {
 /// 확인(스크린샷)에서 "너무 넓어짐" 피드백을 받고서 macOS 표준값으로
 /// 낮췄다 — "맥 기본 터미널의 타이틀이랑 같은 높이"라는 요청과 정확히 일치.
 const TAB_BAR_HEIGHT: f32 = 32.0;
+const STATUS_BAR_HEIGHT: f32 = 24.0;
 
 impl eframe::App for SyncShellApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -574,6 +747,16 @@ impl eframe::App for SyncShellApp {
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 self.show_tab_bar(&ui.ctx().clone(), ui);
             });
+        });
+
+        // 패널은 top/bottom을 먼저 잡아야 left/central이 남은 공간을 쓴다.
+        let pal = self.theme.palette();
+        let status_frame = egui::Frame::NONE
+            .fill(pal.chrome)
+            .inner_margin(egui::Margin::symmetric(12, 0))
+            .stroke(egui::Stroke::new(1.0, pal.border));
+        egui::Panel::bottom("status_bar").exact_size(STATUS_BAR_HEIGHT).frame(status_frame).show(ui, |ui| {
+            status_bar(ui, pal, &self.tabs[self.active]);
         });
 
         // 활성 탭의 셸이 종료됐으면(예: exit 입력) 탭을 닫는다 — 탭이 하나뿐이면
@@ -735,18 +918,69 @@ mod tests {
     use super::*;
     use eframe::egui;
 
-    /// DEV-020 실사용 요청: "위|아래로도 배치할 수 있게". 토글이 실제로
-    /// 좌우↔상하를 오가는지, 그리고 라벨이 "지금 상태"가 아니라 "눌렀을 때
-    /// 될 상태"를 보여주는지(안 그러면 눌러도 안 바뀐 것처럼 헷갈림) 확인한다.
-    #[test]
-    fn panel_layout_toggle_switches_between_side_and_stacked() {
-        let side = PanelLayout::Side;
-        assert_eq!(side.toggled(), PanelLayout::Stacked, "좌우에서 토글했는데 상하로 안 바뀜");
-        assert_eq!(side.toggle_label(), "레이아웃: 상하로", "좌우 상태의 버튼 라벨이 '상하로 바꾸기'를 안내하지 않음");
+    thread_local! {
+        /// `tab_card`가 그린 탭 각각의 실제 위치(탭 인덱스별).
+        static TAB_RECTS: std::cell::RefCell<std::collections::HashMap<usize, egui::Rect>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
 
-        let stacked = side.toggled();
-        assert_eq!(stacked.toggled(), PanelLayout::Side, "상하에서 다시 토글했는데 좌우로 안 돌아옴(왕복 안 됨)");
-        assert_eq!(stacked.toggle_label(), "레이아웃: 좌우로", "상하 상태의 버튼 라벨이 '좌우로 바꾸기'를 안내하지 않음");
+    pub(super) fn record_tab_rect_for_test(index: usize, rect: egui::Rect) {
+        TAB_RECTS.with(|m| m.borrow_mut().insert(index, rect));
+    }
+
+    /// DEV-023: 탭 바에 탭이 실제로 보여야 한다 — 예전엔 오른쪽 버튼 묶음이 남은
+    /// 폭을 다 차지해서 탭이 폭 0으로(화면 밖에) 그려졌다. 탭 카드가 탭 바 안에
+    /// 0보다 큰 폭으로 놓이고, 누르면 그 탭으로 전환되는지 본다.
+    #[test]
+    fn tab_bar_shows_tabs_and_click_switches() {
+        let ctx = egui::Context::default();
+        let mut app = SyncShellApp {
+            tabs: vec![Tab::new(&ctx, std::env::temp_dir(), None), Tab::new(&ctx, std::env::temp_dir(), None)],
+            active: 0,
+            default_shell: None,
+            last_window_rect: None,
+            panel_layout: PanelLayout::default(),
+            theme: ThemeMode::Dark,
+            view_mode: ViewMode::Tree,
+        };
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, TAB_BAR_HEIGHT));
+        let mut frame = |events: Vec<egui::Event>| {
+            TAB_RECTS.with(|m| m.borrow_mut().clear());
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(screen);
+            input.events = events;
+            let _ = ctx.clone().run_ui(input, |ui| {
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    app.show_tab_bar(&ctx, ui);
+                });
+            });
+        };
+        frame(vec![]);
+        frame(vec![]);
+        let second = TAB_RECTS.with(|m| m.borrow().get(&1).copied()).expect("두 번째 탭이 안 그려짐");
+        assert!(second.width() > 50.0, "탭 폭이 거의 0 — 탭이 안 보임: {second:?}");
+        assert!(screen.contains_rect(second), "탭이 탭 바 밖에 그려짐: {second:?}");
+
+        // 탭 제목 쪽(닫기 버튼이 아닌 왼쪽)을 누른다.
+        let pos = egui::pos2(second.left() + 20.0, second.center().y);
+        for pressed in [true, false] {
+            frame(vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+        }
+        assert_eq!(app.active, 1, "두 번째 탭을 눌렀는데 전환되지 않음");
+    }
+
+    /// DEV-020/023: 분할 모양 선택이 `state.toml` 문자열로 왕복되는지.
+    #[test]
+    fn panel_layout_round_trips_through_string_and_defaults_to_side() {
+        for layout in [PanelLayout::Side, PanelLayout::Stacked] {
+            assert_eq!(PanelLayout::parse(layout.as_str()), layout);
+        }
+        assert_eq!(PanelLayout::parse("뭔가"), PanelLayout::Side, "모르는 값은 기본(좌우)으로");
     }
 
     /// DEV-021: 테마를 바꾸면 egui 위젯 색(패널 바탕)이 실제로 바뀌고, 종료 시
@@ -774,6 +1008,9 @@ mod tests {
 
         app.view_mode = ViewMode::Icons;
         assert_eq!(app.session_state().ui.view, "icons", "종료 시 저장할 상태에 보기 방식이 안 들어감(DEV-022)");
+
+        app.panel_layout = PanelLayout::Stacked;
+        assert_eq!(app.session_state().ui.layout, "stacked", "종료 시 저장할 상태에 분할 모양이 안 들어감(DEV-023)");
     }
 
     /// DEV-009: 탭 추가/전환/닫기의 인덱스 계산이 정확한지 — 실제 `Tab::new`(진짜

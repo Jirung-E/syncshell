@@ -19,6 +19,14 @@ pub enum Icon {
     File,
     ChevronRight,
     ChevronDown,
+    Close,
+    Plus,
+    /// 좌우 분할
+    SplitSide,
+    /// 상하 분할
+    SplitStacked,
+    /// 동기화(사슬 고리)
+    Link,
 }
 
 /// `rect` 안에 아이콘을 그린다. 좌표는 16×16 격자 기준으로 잡고 rect 크기에
@@ -62,6 +70,34 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
         Icon::File => {
             poly(&[(4.0, 2.0), (9.5, 2.0), (12.5, 5.0), (12.5, 14.0), (4.0, 14.0)], true);
             poly(&[(9.5, 2.0), (9.5, 5.0), (12.5, 5.0)], false);
+        }
+        Icon::Close => {
+            poly(&[(4.5, 4.5), (11.5, 11.5)], false);
+            poly(&[(11.5, 4.5), (4.5, 11.5)], false);
+        }
+        Icon::Plus => {
+            poly(&[(8.0, 3.0), (8.0, 13.0)], false);
+            poly(&[(3.0, 8.0), (13.0, 8.0)], false);
+        }
+        Icon::SplitSide | Icon::SplitStacked => {
+            painter.rect_stroke(
+                Rect::from_min_max(p(1.5, 2.5), p(14.5, 13.5)),
+                1.5 * s,
+                stroke,
+                egui::StrokeKind::Middle,
+            );
+            if icon == Icon::SplitSide {
+                poly(&[(6.0, 2.5), (6.0, 13.5)], false);
+            } else {
+                poly(&[(1.5, 7.0), (14.5, 7.0)], false);
+            }
+        }
+        Icon::Link => {
+            // 비스듬한 고리 두 개 — 둥근 사각형 두 개를 45° 돌리는 대신, 시안의
+            // SVG 경로(호 두 개 + 가운데 사선)를 선분으로 근사한다.
+            poly(&[(6.5, 9.5), (9.5, 6.5)], false);
+            poly(&[(7.5, 4.5), (8.7, 3.3), (10.2, 2.8), (11.7, 3.3), (12.7, 4.3), (13.2, 5.8), (12.7, 7.3), (11.5, 8.5)], false);
+            poly(&[(8.5, 11.5), (7.3, 12.7), (5.8, 13.2), (4.3, 12.7), (3.3, 11.7), (2.8, 10.2), (3.3, 8.7), (4.5, 7.5)], false);
         }
         Icon::ChevronRight => poly(&[(6.5, 4.5), (10.0, 8.0), (6.5, 11.5)], false),
         Icon::ChevronDown => poly(&[(4.5, 6.5), (8.0, 10.0), (11.5, 6.5)], false),
@@ -148,4 +184,24 @@ pub fn segmented(ui: &mut egui::Ui, pal: &Palette, items: &[(Icon, &str, bool)])
         }
     }
     clicked
+}
+
+/// 테두리 없는 정사각 아이콘 버튼(탭 닫기, 새 탭 등). 마우스를 올리면 바탕이
+/// 살짝 보인다.
+pub fn icon_button(ui: &mut egui::Ui, pal: &Palette, icon: Icon, tooltip: &str, side: f32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(side, side), egui::Sense::click());
+    let resp = resp.on_hover_text(tooltip);
+    paint_icon_button(ui, pal, rect, &resp, icon);
+    resp
+}
+
+/// [`icon_button`]의 그리기 부분 — 이미 잡아둔 영역/응답에 그릴 때(탭 안의 닫기
+/// 버튼처럼 위치를 직접 계산하는 경우) 쓴다.
+pub fn paint_icon_button(ui: &egui::Ui, pal: &Palette, rect: Rect, resp: &egui::Response, icon: Icon) {
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 5.0, pal.hover);
+    }
+    let fg = if resp.hovered() { pal.text } else { pal.muted };
+    let icon_side = (rect.width() * 0.6).min(14.0);
+    paint_icon(ui.painter(), Rect::from_center_size(rect.center(), vec2(icon_side, icon_side)), icon, fg);
 }

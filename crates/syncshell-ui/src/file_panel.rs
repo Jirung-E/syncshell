@@ -189,26 +189,8 @@ pub fn show(ui: &mut egui::Ui, fs: &FsView, state: &mut FilePanelState, panel_ac
         }
     }
 
-    ui.horizontal(|ui| {
-        ui.heading("탐색기");
-        // 트리/아이콘 전환(DEV-022). 글리프 대신 painter로 그린 아이콘이라
-        // 폰트에 없는 기호가 두부로 나올 걱정이 없다(chrome.rs 참고).
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let picked = chrome::segmented(
-                ui,
-                theme::current(ui),
-                &[
-                    (Icon::Tree, "트리 보기", state.view_mode == ViewMode::Tree),
-                    (Icon::Grid, "아이콘 보기", state.view_mode == ViewMode::Icons),
-                ],
-            );
-            match picked {
-                Some(0) => state.view_mode = ViewMode::Tree,
-                Some(1) => state.view_mode = ViewMode::Icons,
-                _ => {}
-            }
-        });
-    });
+    // 경로바(박스 안 브레드크럼) + 오른쪽 트리/아이콘 전환(DEV-022/023). 예전의
+    // "탐색기" 제목 줄은 뺐다 — 경로바가 이 패널이 무엇인지 충분히 말해준다.
     // 현재 경로를 조상 폴더별로 쪼갠 클릭 가능한 세그먼트(브레드크럼)로 보여준다
     // — 경로 직접 입력은 스코프에서 뺐다(터미널에서 cd 치면 어차피 동기화되므로
     // 커맨드라인이 그 역할을 대신함, 2026-08-06 결정). 우클릭 = 폴더 배경 메뉴
@@ -216,7 +198,37 @@ pub fn show(ui: &mut egui::Ui, fs: &FsView, state: &mut FilePanelState, panel_ac
     // "목록의 빈 공간 우클릭"은 더 이상 안전하게 구현할 수 없어(가상 스크롤
     // 영역은 빈 공간이 따로 없음) 여기로 옮겼다 — 많은 탐색기가 경로 표시줄
     // 우클릭에 폴더 메뉴를 두는 것과 같은 자리.
-    breadcrumb(ui, &fs.current_dir, &mut action, state.clipboard.is_some());
+    let pal = theme::current(ui);
+    ui.horizontal(|ui| {
+        const SEGMENT_W: f32 = 2.0 * 28.0 + 4.0;
+        let box_w = (ui.available_width() - SEGMENT_W - ui.spacing().item_spacing.x).max(40.0);
+        ui.allocate_ui_with_layout(vec2(box_w, 28.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            egui::Frame::NONE
+                .fill(pal.bg)
+                .stroke(egui::Stroke::new(1.0, pal.border))
+                .corner_radius(6)
+                .inner_margin(egui::Margin::symmetric(6, 3))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    breadcrumb(ui, &fs.current_dir, &mut action, state.clipboard.is_some());
+                });
+        });
+        // 트리/아이콘 전환. 글리프 대신 painter로 그린 아이콘이라 폰트에 없는
+        // 기호가 두부로 나올 걱정이 없다(chrome.rs 참고).
+        let picked = chrome::segmented(
+            ui,
+            pal,
+            &[
+                (Icon::Tree, "트리 보기", state.view_mode == ViewMode::Tree),
+                (Icon::Grid, "아이콘 보기", state.view_mode == ViewMode::Icons),
+            ],
+        );
+        match picked {
+            Some(0) => state.view_mode = ViewMode::Tree,
+            Some(1) => state.view_mode = ViewMode::Icons,
+            _ => {}
+        }
+    });
 
     if let Some(msg) = state.status.clone() {
         // 테마(DEV-021)를 따른다 — 고정 색이면 라이트 모드에서 연두색 안내
@@ -586,16 +598,21 @@ fn breadcrumb(ui: &mut egui::Ui, current_dir: &Path, action: &mut Option<FileAct
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         // `ancestors`는 현재 폴더가 맨 앞, 루트가 맨 뒤 순서라 뒤집어서 루트부터 보여준다.
+        let faint = theme::current(ui).faint;
         for (idx, ancestor) in ancestors.iter().rev().enumerate() {
-            if idx > 0 {
-                ui.weak(">");
+            // 맨 앞 루트("/", "C:\\")는 그 자체가 구분자 모양이라 바로 뒤엔 또
+            // 찍지 않는다("/ / Users"가 되지 않게).
+            if idx > 1 {
+                ui.label(egui::RichText::new("/").color(faint));
             }
             let is_current = idx == ancestors.len() - 1;
             let name = ancestor
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| ancestor.display().to_string());
-            let response = ui.add(egui::Button::selectable(is_current, name).small());
+            // 지금 폴더는 진하게, 조상은 흐리게 — 선택 바탕 대신 글자로 구분한다.
+            let text = if is_current { egui::RichText::new(name).strong() } else { egui::RichText::new(name).weak() };
+            let response = ui.add(egui::Button::new(text).small().frame(false));
             #[cfg(test)]
             tests::record_breadcrumb_segment_rect_for_test(ancestor, response.rect);
             if response.clicked() && !is_current {
