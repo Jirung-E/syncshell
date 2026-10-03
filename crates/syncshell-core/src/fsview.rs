@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+#[derive(Debug, Clone)]
 pub struct DirEntry {
     pub name: String,
     pub path: PathBuf,
@@ -220,7 +221,9 @@ fn cmp_entries(a: &DirEntry, b: &DirEntry) -> std::cmp::Ordering {
     }
 }
 
-fn read_dir_sorted(path: &Path) -> std::io::Result<Vec<DirEntry>> {
+/// 폴더 하나를 읽어 폴더 먼저·이름순으로 돌려준다. 탐색기 트리 보기에서 하위
+/// 폴더를 펼칠 때도 같은 규칙(정렬·심볼릭 링크 처리)을 쓰려고 공개한다(DEV-022).
+pub fn read_dir_sorted(path: &Path) -> std::io::Result<Vec<DirEntry>> {
     let mut entries: Vec<DirEntry> = std::fs::read_dir(path)?
         .filter_map(|e| e.ok())
         .map(|e| {

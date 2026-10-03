@@ -168,6 +168,12 @@ pub static LIGHT: Palette = Palette {
     },
 };
 
+/// 지금 적용된 테마의 팔레트. 위젯 함수마다 팔레트를 인자로 넘기지 않으려고
+/// [`apply`]가 정한 egui `Visuals::dark_mode`로 되짚는다 — 테마는 둘뿐이라 충분하다.
+pub fn current(ui: &egui::Ui) -> &'static Palette {
+    if ui.visuals().dark_mode { &DARK } else { &LIGHT }
+}
+
 /// egui 기본 위젯(버튼·메뉴·텍스트 칸·스크롤바 등)이 팔레트를 따르게 한다.
 pub fn apply(ctx: &egui::Context, mode: ThemeMode) {
     let p = mode.palette();

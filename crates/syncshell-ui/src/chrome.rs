@@ -11,6 +11,14 @@ use eframe::egui::{self, pos2, vec2, Color32, Pos2, Rect, Stroke};
 pub enum Icon {
     Sun,
     Moon,
+    /// 트리 보기
+    Tree,
+    /// 아이콘(격자) 보기
+    Grid,
+    Folder,
+    File,
+    ChevronRight,
+    ChevronDown,
 }
 
 /// `rect` 안에 아이콘을 그린다. 좌표는 16×16 격자 기준으로 잡고 rect 크기에
@@ -21,7 +29,42 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
     let p = |x: f32, y: f32| -> Pos2 { o + vec2(x * s, y * s) };
     let stroke = Stroke::new(1.4 * s.max(0.9), color);
 
+    let poly = |pts: &[(f32, f32)], closed: bool| {
+        let pts: Vec<Pos2> = pts.iter().map(|&(x, y)| p(x, y)).collect();
+        if closed {
+            painter.add(egui::Shape::closed_line(pts, stroke));
+        } else {
+            painter.add(egui::Shape::line(pts, stroke));
+        }
+    };
+
     match icon {
+        Icon::Tree => {
+            poly(&[(2.5, 3.5), (13.5, 3.5)], false);
+            poly(&[(6.0, 8.0), (13.5, 8.0)], false);
+            poly(&[(6.0, 12.5), (13.5, 12.5)], false);
+            poly(&[(3.5, 3.5), (3.5, 12.5), (6.0, 12.5)], false);
+            poly(&[(3.5, 8.0), (6.0, 8.0)], false);
+        }
+        Icon::Grid => {
+            for (x, y) in [(2.5, 2.5), (9.0, 2.5), (2.5, 9.0), (9.0, 9.0)] {
+                painter.rect_stroke(
+                    Rect::from_min_size(p(x, y), vec2(4.5 * s, 4.5 * s)),
+                    1.0 * s,
+                    stroke,
+                    egui::StrokeKind::Middle,
+                );
+            }
+        }
+        Icon::Folder => {
+            poly(&[(2.0, 4.0), (2.0, 13.0), (14.0, 13.0), (14.0, 5.5), (8.0, 5.5), (6.5, 4.0)], true);
+        }
+        Icon::File => {
+            poly(&[(4.0, 2.0), (9.5, 2.0), (12.5, 5.0), (12.5, 14.0), (4.0, 14.0)], true);
+            poly(&[(9.5, 2.0), (9.5, 5.0), (12.5, 5.0)], false);
+        }
+        Icon::ChevronRight => poly(&[(6.5, 4.5), (10.0, 8.0), (6.5, 11.5)], false),
+        Icon::ChevronDown => poly(&[(4.5, 6.5), (8.0, 10.0), (11.5, 6.5)], false),
         Icon::Sun => {
             painter.circle_stroke(p(8.0, 8.0), 3.0 * s, stroke);
             for i in 0..8 {

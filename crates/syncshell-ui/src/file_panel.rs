@@ -1,5 +1,8 @@
-use eframe::egui;
+use crate::chrome::{self, Icon};
+use crate::theme::{self, Palette};
+use eframe::egui::{self, pos2, vec2, Color32, FontId, Rect};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use syncshell_core::fsview::{DirEntry, FsView};
 
 /// 탐색기 패널에서 사용자가 고른 동작. 패널 렌더링 함수는 이걸 돌려주기만 하고
@@ -58,37 +61,54 @@ pub struct FilePanelState {
     /// 필요해서 추가함(실사용 피드백: "복사/붙여넣기 작동 안 함" → 우클릭
     /// 메뉴는 되지만 단축키가 없어서 그렇게 느꼈을 가능성이 컸음).
     pub selected: Option<PathBuf>,
-    /// 좌측 디렉터리 트리에서 펼쳐진 폴더들.
+    /// 트리 보기에서 그 자리에 펼쳐 둔 폴더들(DEV-022). 현재 폴더 기준이라
+    /// 다른 폴더로 이동하면 비운다([`reset_tree_if_moved`]).
     pub tree_expanded: std::collections::HashSet<PathBuf>,
-    /// 트리에서 펼쳐본 폴더의 하위 폴더 목록. 배경 스레드에서 읽어오는 동안은
-    /// `Loading`, 다 읽으면 `Loaded`로 바뀐다 — 시스템 임시 폴더처럼 항목이
-    /// 아주 많은 폴더를 펼쳤을 때 UI 스레드가 멈추는 걸 실측으로 확인해서
-    /// (5000행 렌더링 성능 테스트가 178ms까지 튀는 걸로 드러남) 비동기로 바꿨다.
+    /// 펼친 폴더의 하위 항목. 배경 스레드에서 읽어오는 동안은 `Loading`, 다
+    /// 읽으면 `Loaded`로 바뀐다 — UI 스레드는 디스크를 읽지 않는다(항목이 아주
+    /// 많은 폴더를 펼쳤을 때 프레임이 멈추는 걸 실측으로 확인함, 5000행 성능
+    /// 테스트가 178ms까지 튐).
     tree_children: std::collections::HashMap<PathBuf, TreeChildren>,
-    /// 배경 스레드의 트리 하위 목록 읽기 결과가 도착하는 채널.
-    tree_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<PathBuf>)>,
-    tree_tx: std::sync::mpsc::Sender<(PathBuf, Vec<PathBuf>)>,
-    /// 마지막으로 현재 경로까지 조상 체인을 자동으로 펼쳐준 경로. 탐색기가 새
-    /// 폴더로 이동할 때마다(터미널 cd 등으로도) 그 경로까지 트리가 자동으로
-    /// 펼쳐지게 하되, 매 프레임 반복하면 사용자가 손으로 접어둔 것까지 되살아나
-    /// 버리므로 "이 경로에 대해서는 이미 한 번 해줬다"를 기억해둔다.
-    tree_synced_for: Option<PathBuf>,
-    /// 우측 내용 영역을 목록(이름·크기·수정일)으로 보여줄지, 아이콘 격자로
-    /// 보여줄지(실사용 요청: "아이콘뷰가 필요함").
+    /// 배경 스레드의 하위 목록 읽기 결과가 도착하는 채널.
+    tree_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<DirEntry>)>,
+    tree_tx: std::sync::mpsc::Sender<(PathBuf, Vec<DirEntry>)>,
+    /// 지금 펼침 상태가 어느 폴더 기준인지.
+    tree_for: Option<PathBuf>,
+    /// 트리(이름·크기·수정일 + 그 자리 펼침)로 보여줄지, 아이콘 격자로
+    /// 보여줄지(실사용 요청: "아이콘뷰가 필요함", DEV-022). 앱 전역 설정이라
+    /// 호출부(`SyncShellApp`)가 매 프레임 넣어주고 바뀌면 다시 읽어간다.
     pub view_mode: ViewMode,
 }
 
 /// [`FilePanelState::view_mode`] 참고.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
-    List,
+    Tree,
     Icons,
+}
+
+impl ViewMode {
+    /// `state.toml`의 `[ui] view` 값.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tree => "tree",
+            Self::Icons => "icons",
+        }
+    }
+
+    /// 모르는 값(손으로 고쳤거나 예전 값)은 기본(트리)으로.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "icons" => Self::Icons,
+            _ => Self::Tree,
+        }
+    }
 }
 
 /// [`FilePanelState::tree_children`] 참고.
 enum TreeChildren {
     Loading,
-    Loaded(Vec<PathBuf>),
+    Loaded(Vec<DirEntry>),
 }
 
 impl Default for FilePanelState {
@@ -104,8 +124,8 @@ impl Default for FilePanelState {
             tree_children: std::collections::HashMap::new(),
             tree_rx,
             tree_tx,
-            tree_synced_for: None,
-            view_mode: ViewMode::List,
+            tree_for: None,
+            view_mode: ViewMode::Tree,
         }
     }
 }
@@ -171,17 +191,21 @@ pub fn show(ui: &mut egui::Ui, fs: &FsView, state: &mut FilePanelState, panel_ac
 
     ui.horizontal(|ui| {
         ui.heading("탐색기");
-        // 목록/아이콘 전환 — 실사용 요청: "아이콘뷰가 필요함". 아이콘 텍스트
-        // ("⊞"/"☰" 같은) 대신 한글 라벨을 쓴다 — 예전에 "✕"(U+2715)가 일반
-        // 폰트에 없어 두부로 나온 적이 있어서(file_panel 상태 메시지 닫기
-        // 버튼), 검증 안 된 기호 글리프를 새로 들이는 것보다 이미 커버가
-        // 확인된 한글 쪽이 안전하다.
+        // 트리/아이콘 전환(DEV-022). 글리프 대신 painter로 그린 아이콘이라
+        // 폰트에 없는 기호가 두부로 나올 걱정이 없다(chrome.rs 참고).
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.selectable_label(state.view_mode == ViewMode::Icons, "아이콘").clicked() {
-                state.view_mode = ViewMode::Icons;
-            }
-            if ui.selectable_label(state.view_mode == ViewMode::List, "목록").clicked() {
-                state.view_mode = ViewMode::List;
+            let picked = chrome::segmented(
+                ui,
+                theme::current(ui),
+                &[
+                    (Icon::Tree, "트리 보기", state.view_mode == ViewMode::Tree),
+                    (Icon::Grid, "아이콘 보기", state.view_mode == ViewMode::Icons),
+                ],
+            );
+            match picked {
+                Some(0) => state.view_mode = ViewMode::Tree,
+                Some(1) => state.view_mode = ViewMode::Icons,
+                _ => {}
             }
         });
     });
@@ -215,64 +239,23 @@ pub fn show(ui: &mut egui::Ui, fs: &FsView, state: &mut FilePanelState, panel_ac
     }
     ui.separator();
 
-    // 탐색기가 새 폴더로 옮겨갈 때마다(사용자 클릭이든 터미널 cd 동기화든)
-    // 좌측 트리가 그 경로까지 자동으로 펼쳐지게 한다 — 매 프레임 반복하지
-    // 않도록 이미 해준 경로는 건너뛴다(사용자가 손으로 접어둔 게 되살아나지
-    // 않게).
-    ensure_tree_expanded_to_current(state, &fs.current_dir);
+    reset_tree_if_moved(state, &fs.current_dir);
 
-    // `ui.horizontal()`은 자기 내부 Ui의 높이를 부모의 남은 높이 전체가 아니라
-    // 한 줄 높이(`interact_size.y`)로 잡는다(`ui.vertical()`과 다른 부분 —
-    // egui 소스의 `horizontal_centered` 문서에 "Like horizontal, but allocates
-    // the full vertical height"라고 명시돼 있어, 반대로 읽으면 평범한
-    // `horizontal`은 그렇지 않다는 뜻). 그 안에서 그냥 `ui.available_height()`를
-    // 다시 물어보면 이 좁은 한 줄 높이가 나와서, 트리·파일 목록 스크롤 영역이
-    // 실제로는 몇 줄짜리 좁은 띠 안에 갇혀버린다(실측: 클릭 테스트에서 트리
-    // 두 번째 행이 clip 영역 밖으로 밀려나 클릭이 전혀 안 먹힘 — 5000행 성능
-    // 테스트가 "통과"한 것도 사실은 같은 이유로 거의 안 그려져서였다). 그래서
-    // 진짜 남은 높이를 `ui.horizontal()` 밖에서 미리 구해서 넘겨준다.
-    let available_height = ui.available_height();
+    // ".."과 오류 표시는 목록(entries) 밖 고정 영역에 둔다 — 아래 스크롤 영역이
+    // `show_rows`로 가상 스크롤되므로, 스크롤 대상이 아닌 것들은 여기서 미리 그린다.
+    if let Some(parent) = fs.current_dir.parent() {
+        if ui.selectable_label(false, "..").clicked() {
+            action = Some(FileAction::Navigate(parent.to_path_buf()));
+        }
+    }
+    if let Some(err) = &fs.error {
+        ui.colored_label(ui.visuals().error_fg_color, err);
+    }
 
-    ui.horizontal(|ui| {
-        let tree_width = 160.0;
-        ui.allocate_ui_with_layout(
-            egui::vec2(tree_width, available_height),
-            egui::Layout::top_down(egui::Align::Min),
-            |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("dir_tree_scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        let root = tree_root(&fs.current_dir);
-                        tree_node(ui, &root, &fs.current_dir, state, &mut action, 0);
-                    });
-            },
-        );
-
-        ui.separator();
-
-        ui.allocate_ui_with_layout(
-            egui::vec2(ui.available_width(), available_height),
-            egui::Layout::top_down(egui::Align::Min),
-            |ui| {
-            // ".."과 오류 표시는 목록(entries) 밖 고정 영역에 둔다 — 아래 스크롤 영역이
-            // `show_rows`로 가상 스크롤되므로, 스크롤 대상이 아닌 것들은 여기서 미리 그린다.
-            if let Some(parent) = fs.current_dir.parent() {
-                if ui.selectable_label(false, "..").clicked() {
-                    action = Some(FileAction::Navigate(parent.to_path_buf()));
-                }
-            }
-            if let Some(err) = &fs.error {
-                ui.colored_label(ui.visuals().error_fg_color, err);
-            }
-
-            match state.view_mode {
-                ViewMode::List => list_view(ui, fs, state, &mut action),
-                ViewMode::Icons => icon_view(ui, fs, state, &mut action),
-            }
-            },
-        );
-    });
+    match state.view_mode {
+        ViewMode::Tree => tree_view(ui, fs, state, &mut action),
+        ViewMode::Icons => icon_view(ui, fs, state, &mut action),
+    }
 
     if let Some(picked) = rename_dialog(ui.ctx(), state) {
         action = Some(picked);
@@ -303,63 +286,215 @@ fn handle_entry_click(
     }
 }
 
-/// 이름·크기·수정일이 나오는 목록 뷰(기존 기본 형태).
-///
-/// DEV-005 Test plan: "대용량 디렉터리(수천 개 파일) 가상 스크롤". 처음엔
-/// ScrollArea에 전체 목록을 그냥 다 그렸는데, 5000개 항목에서 프레임당 200ms대
-/// (60fps 예산 16.7ms의 10배 이상)까지 나오는 걸 실측하고서 `show_rows`(화면에
-/// 보이는 행만 그리는 내장 가상 스크롤)로 바꿨다.
-fn list_view(ui: &mut egui::Ui, fs: &FsView, state: &mut FilePanelState, action: &mut Option<FileAction>) {
-    let row_height = ui.text_style_height(&egui::TextStyle::Button).max(20.0);
-    let meta_width = 130.0;
-    egui::ScrollArea::vertical()
-        .id_salt("file_list_scroll")
-        .auto_shrink([false, false])
-        .show_rows(ui, row_height, fs.entries.len(), |ui, row_range| {
-            for entry in &fs.entries[row_range] {
-                ui.horizontal(|ui| {
-                    let name_width = (ui.available_width() - meta_width).max(20.0);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(name_width, row_height),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            // 아이콘은 DEV-011 메모와 같은 방침 — 셸 아이콘 추출 대신
-                            // 확장자 기반 정적 아이콘으로 시작한다(SHGetFileInfo 등
-                            // 플랫폼 API 직접 호출 금지, DEV-008 방침과도 일치).
-                            let label = format!("{} {}", entry_icon(entry.is_dir, &entry.name), entry.name);
-                            // 파일은 선택 상태를 하이라이트로 보여준다(Cmd+C 등 단축키가
-                            // 뭘 대상으로 할지 눈에 보여야 함) — 폴더는 클릭하면 바로
-                            // 이동해버려서 "선택" 개념 자체가 없다(항상 false).
-                            let selected = !entry.is_dir && state.selected.as_deref() == Some(entry.path.as_path());
-                            // .truncate() 필수 — 안 그러면 이름이 name_width보다 길 때
-                            // 잘리지 않고 그대로 그려져서 옆 크기/수정일 컬럼과 겹친다
-                            // (실사용 버그 리포트: "문서 제목과 수정 날짜가 겹쳐서 출력").
-                            let response = ui.add(egui::Button::selectable(selected, label).truncate());
-                            #[cfg(test)]
-                            tests::record_row_rect_for_test(&entry.path, response.rect);
+/// 트리 보기의 한 줄이 무엇을 그리는지. 매 프레임 펼침 상태로 평탄화하는데,
+/// 항목(`DirEntry`) 자체는 복사하지 않고 위치만 들고 있다가 화면에 보이는
+/// 줄만 꺼내 그린다 — 5000개짜리 폴더에서 매 프레임 전부 복사하지 않게.
+enum TreeRow {
+    /// `fs.entries[i]`
+    Top(usize),
+    /// `parents[parent]` 폴더의 `idx`번째 하위 항목
+    Child { parent: usize, idx: usize, depth: usize },
+    /// 펼쳤지만 아직 배경 스레드가 하위 목록을 읽는 중
+    Loading { depth: usize },
+}
 
-                            handle_entry_click(entry, &response, state, action);
+const TREE_ROW_HEIGHT: f32 = 26.0;
+const TREE_INDENT: f32 = 18.0;
+const SIZE_COL: f32 = 64.0;
+const DATE_COL: f32 = 112.0;
+const COL_GAP: f32 = 8.0;
+/// 줄 오른쪽 여백(스크롤바가 겹치는 자리 포함).
+const ROW_RIGHT_PAD: f32 = 12.0;
 
-                            response.context_menu(|ui| {
-                                if let Some(picked) = entry_menu(ui, &entry.path, entry.is_dir) {
-                                    *action = Some(picked);
-                                    ui.close();
-                                }
-                            });
-                        },
-                    );
+fn flatten_tree(fs: &FsView, state: &FilePanelState) -> (Vec<TreeRow>, Vec<PathBuf>) {
+    let mut rows = Vec::with_capacity(fs.entries.len());
+    let mut parents = Vec::new();
+    for (i, entry) in fs.entries.iter().enumerate() {
+        rows.push(TreeRow::Top(i));
+        if entry.is_dir {
+            push_tree_children(state, &entry.path, 1, &mut rows, &mut parents);
+        }
+    }
+    (rows, parents)
+}
 
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(meta_width, row_height),
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            ui.weak(if entry.is_dir { String::new() } else { format_size(entry.size) });
-                            ui.weak(entry.modified.map(format_modified).unwrap_or_default());
-                        },
-                    );
-                });
+fn push_tree_children(
+    state: &FilePanelState,
+    path: &Path,
+    depth: usize,
+    rows: &mut Vec<TreeRow>,
+    parents: &mut Vec<PathBuf>,
+) {
+    if !state.tree_expanded.contains(path) {
+        return;
+    }
+    match state.tree_children.get(path) {
+        Some(TreeChildren::Loaded(children)) => {
+            let parent = parents.len();
+            parents.push(path.to_path_buf());
+            for (idx, child) in children.iter().enumerate() {
+                rows.push(TreeRow::Child { parent, idx, depth });
+                if child.is_dir {
+                    push_tree_children(state, &child.path, depth + 1, rows, parents);
+                }
             }
-        });
+        }
+        Some(TreeChildren::Loading) | None => rows.push(TreeRow::Loading { depth }),
+    }
+}
+
+/// 트리 보기(DEV-022) — 현재 폴더의 항목을 이름·크기·수정일 열과 함께 보여주고,
+/// 폴더 옆 화살표로 그 자리에서 하위 항목을 펼친다. 예전의 "좌측 폴더 트리 +
+/// 우측 목록" 2단을 하나로 합친 것이다(상위 폴더로는 브레드크럼/".."로 간다).
+///
+/// DEV-005 Test plan: "대용량 디렉터리(수천 개 파일) 가상 스크롤" — 펼친 하위
+/// 항목까지 한 줄 목록으로 평탄화해서 `show_rows`(화면에 보이는 줄만 그림)를
+/// 그대로 쓴다.
+///
+/// **알려진 한계**: 펼친 하위 폴더의 내용은 펼친 시점에 한 번 읽는다 — 파일
+/// 감시(DEV-007)는 현재 폴더만 보므로, 하위 폴더 안의 변경은 접었다 다시 펼쳐야
+/// 반영된다.
+fn tree_view(ui: &mut egui::Ui, fs: &FsView, state: &mut FilePanelState, action: &mut Option<FileAction>) {
+    let pal = theme::current(ui);
+
+    // 열 머리
+    let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), egui::Sense::hover());
+    let font = FontId::proportional(11.0);
+    let cy = head.center().y;
+    let meta_right = head.right() - ROW_RIGHT_PAD;
+    let painter = ui.painter();
+    painter.text(pos2(head.left() + 6.0 + 20.0 + 24.0, cy), egui::Align2::LEFT_CENTER, "이름", font.clone(), pal.muted);
+    painter.text(pos2(meta_right - DATE_COL - COL_GAP, cy), egui::Align2::RIGHT_CENTER, "크기", font.clone(), pal.muted);
+    painter.text(pos2(meta_right, cy), egui::Align2::RIGHT_CENTER, "수정일", font, pal.muted);
+    painter.hline(head.x_range(), head.bottom(), egui::Stroke::new(1.0, pal.border));
+
+    let (rows, parents) = flatten_tree(fs, state);
+    ui.scope(|ui| {
+        // 줄 사이 틈 없이 붙인다 — 선택/호버 바탕이 줄 단위로 이어져 보이게.
+        ui.spacing_mut().item_spacing.y = 0.0;
+        egui::ScrollArea::vertical()
+            .id_salt("file_list_scroll")
+            .auto_shrink([false, false])
+            .show_rows(ui, TREE_ROW_HEIGHT, rows.len(), |ui, row_range| {
+                for row in &rows[row_range] {
+                    let (entry, depth) = match *row {
+                        TreeRow::Top(i) => (fs.entries[i].clone(), 0),
+                        TreeRow::Child { parent, idx, depth } => {
+                            match state.tree_children.get(&parents[parent]) {
+                                Some(TreeChildren::Loaded(children)) => (children[idx].clone(), depth),
+                                _ => continue,
+                            }
+                        }
+                        TreeRow::Loading { depth } => {
+                            let (rect, _) =
+                                ui.allocate_exact_size(vec2(ui.available_width(), TREE_ROW_HEIGHT), egui::Sense::hover());
+                            ui.painter().text(
+                                pos2(rect.left() + 6.0 + depth as f32 * TREE_INDENT + 20.0, rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                "불러오는 중…",
+                                FontId::proportional(12.0),
+                                pal.muted,
+                            );
+                            continue;
+                        }
+                    };
+                    tree_row(ui, pal, &entry, depth, state, action);
+                }
+            });
+    });
+}
+
+/// 트리 한 줄. 줄 전체가 클릭 영역(폴더 = 이동, 파일 = 선택/더블클릭 열기 —
+/// [`handle_entry_click`])이고, 폴더 앞 화살표만 따로 "그 자리 펼침/접기"다.
+fn tree_row(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    entry: &DirEntry,
+    depth: usize,
+    state: &mut FilePanelState,
+    action: &mut Option<FileAction>,
+) {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), TREE_ROW_HEIGHT), egui::Sense::click());
+    #[cfg(test)]
+    tests::record_row_rect_for_test(&entry.path, rect);
+
+    let x0 = rect.left() + 6.0 + depth as f32 * TREE_INDENT;
+    let chevron_rect = Rect::from_min_size(pos2(x0, rect.center().y - 7.0), vec2(14.0, 14.0));
+    // 화살표는 줄보다 나중에 등록해야 egui가 위에 있는 걸로 보고 클릭을 화살표에
+    // 준다(겹치는 위젯은 나중에 등록된 쪽이 이김) — 그래야 펼치려고 누른 클릭이
+    // 그 폴더로 "이동"까지 해버리지 않는다.
+    let chevron_clicked = entry.is_dir && {
+        let r = ui.interact(chevron_rect.expand(4.0), ui.id().with(("tree_chevron", &entry.path)), egui::Sense::click());
+        #[cfg(test)]
+        tests::record_chevron_rect_for_test(&entry.path, r.rect);
+        r.clicked()
+    };
+
+    if ui.is_rect_visible(rect) {
+        let selected = !entry.is_dir && state.selected.as_deref() == Some(entry.path.as_path());
+        let painter = ui.painter();
+        let fill = if selected {
+            pal.selection
+        } else if response.hovered() {
+            pal.hover
+        } else {
+            Color32::TRANSPARENT
+        };
+        painter.rect_filled(rect.shrink2(vec2(2.0, 1.0)), 5.0, fill);
+        let (fg, meta) = if selected { (pal.selection_text, pal.selection_text) } else { (pal.text, pal.muted) };
+
+        if entry.is_dir {
+            let icon = if state.tree_expanded.contains(&entry.path) { Icon::ChevronDown } else { Icon::ChevronRight };
+            chrome::paint_icon(painter, chevron_rect.shrink(2.0), icon, pal.muted);
+        }
+        let icon_rect = Rect::from_min_size(pos2(x0 + 20.0, rect.center().y - 8.0), vec2(16.0, 16.0));
+        let (icon, icon_color) = if entry.is_dir { (Icon::Folder, pal.accent) } else { (Icon::File, pal.muted) };
+        chrome::paint_icon(painter, icon_rect, icon, icon_color);
+
+        let meta_right = rect.right() - ROW_RIGHT_PAD;
+        let name_left = icon_rect.right() + 8.0;
+        let name_max = (meta_right - DATE_COL - COL_GAP - SIZE_COL - COL_GAP - name_left).max(10.0);
+        let galley = name_galley(ui, &entry.name, name_max, fg);
+        painter.galley(pos2(name_left, rect.center().y - galley.size().y / 2.0), galley, fg);
+
+        let small = FontId::proportional(12.0);
+        let cy = rect.center().y;
+        if !entry.is_dir {
+            painter.text(pos2(meta_right - DATE_COL - COL_GAP, cy), egui::Align2::RIGHT_CENTER, format_size(entry.size), small.clone(), meta);
+        }
+        if let Some(m) = entry.modified {
+            painter.text(pos2(meta_right, cy), egui::Align2::RIGHT_CENTER, format_modified(m), small, meta);
+        }
+    }
+
+    if chevron_clicked {
+        toggle_tree_expanded(ui.ctx(), state, &entry.path);
+    } else {
+        handle_entry_click(entry, &response, state, action);
+    }
+
+    response.context_menu(|ui| {
+        if let Some(picked) = entry_menu(ui, &entry.path, entry.is_dir) {
+            *action = Some(picked);
+            ui.close();
+        }
+    });
+}
+
+/// 이름 칸 한 줄. 넘치면 말줄임(…)으로 자른다 — 안 자르면 옆 크기/수정일 열과
+/// 겹친다(실사용 버그 리포트: "문서 제목과 수정 날짜가 겹쳐서 출력").
+fn name_galley(ui: &egui::Ui, name: &str, max_width: f32, color: Color32) -> Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::single_section(
+        name.to_owned(),
+        egui::TextFormat::simple(FontId::proportional(13.0), color),
+    );
+    job.wrap = egui::text::TextWrapping {
+        max_width,
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    ui.painter().layout_job(job)
 }
 
 /// 아이콘 격자 뷰(실사용 요청: "아이콘뷰가 필요함"). 목록 뷰와 같은 가상
@@ -404,20 +539,18 @@ fn icon_cell(
     tests::record_row_rect_for_test(&entry.path, rect);
 
     if ui.is_rect_visible(rect) {
+        let pal = theme::current(ui);
         let selected = !entry.is_dir && state.selected.as_deref() == Some(entry.path.as_path());
-        if selected || response.hovered() {
-            let visuals = ui.style().interact_selectable(&response, selected);
-            ui.painter().rect_filled(rect, 4.0, visuals.bg_fill);
+        if selected {
+            ui.painter().rect(rect.shrink(2.0), 8.0, pal.selection, egui::Stroke::new(1.0, pal.accent), egui::StrokeKind::Inside);
+        } else if response.hovered() {
+            ui.painter().rect_filled(rect.shrink(2.0), 8.0, pal.hover);
         }
 
         const NAME_HEIGHT: f32 = 26.0;
-        let icon_rect = egui::Rect::from_min_size(rect.min, egui::vec2(size.x, size.y - NAME_HEIGHT));
-        ui.put(
-            icon_rect,
-            egui::Label::new(egui::RichText::new(entry_icon(entry.is_dir, &entry.name)).size(28.0))
-                .halign(egui::Align::Center)
-                .selectable(false),
-        );
+        let icon_center = pos2(rect.center().x, rect.min.y + (size.y - NAME_HEIGHT) / 2.0 + 4.0);
+        let (icon, color) = if entry.is_dir { (Icon::Folder, pal.accent) } else { (Icon::File, pal.muted) };
+        chrome::paint_icon(ui.painter(), Rect::from_center_size(icon_center, vec2(30.0, 30.0)), icon, color);
         let name_rect =
             egui::Rect::from_min_size(egui::pos2(rect.min.x, rect.max.y - NAME_HEIGHT), egui::vec2(size.x, NAME_HEIGHT));
         ui.put(
@@ -480,44 +613,21 @@ fn breadcrumb(ui: &mut egui::Ui, current_dir: &Path, action: &mut Option<FileAct
     });
 }
 
-/// 트리에서 현재 폴더 위로 자동으로 펼쳐 보여줄 조상 단계 수(자기 자신 포함).
-/// [`tree_root`]와 [`ensure_tree_expanded_to_current`]가 같이 쓴다 — 반드시
-/// 같은 값이어야 "뿌리부터 현재 폴더까지 전부 펼쳐져 보인다"가 성립한다.
-const TREE_AUTO_EXPAND_LEVELS: usize = 4;
-
-/// 트리의 뿌리 — 진짜 파일시스템 루트(`/`)가 아니라 현재 폴더에서 가까운
-/// 조상([`TREE_AUTO_EXPAND_LEVELS`]단계 이내)이다. 처음엔 진짜 루트를 뿌리로
-/// 삼고 현재 폴더까지 조상 체인을 전부 자동으로 펼쳤는데, macOS의
-/// `/private/var/folders/.../T`(임시 파일 폴더) 같은 중간 조상이 항목 수천
-/// 개짜리라 배경 로딩이 오래 걸리고, 로딩이 끝날 때마다 트리 위쪽에 새 행이
-/// 끼어들어 아래쪽(현재 폴더 근처) 행들의 위치가 계속 흔들리는 게 실측으로
-/// 드러났다(트리 노드 클릭 테스트가 위치를 알아낸 직후 클릭하는 그 짧은 사이에도
-/// 위치가 바뀌어 클릭이 빗나갔음). 더 위쪽 조상(진짜 루트까지)은 브레드크럼으로
-/// 여전히 갈 수 있다 — 트리는 "지금 있는 곳 근처"를 보여주는 용도로 좁혔다.
-fn tree_root(current_dir: &Path) -> PathBuf {
-    current_dir
-        .ancestors()
-        .take(TREE_AUTO_EXPAND_LEVELS)
-        .last()
-        .unwrap_or(current_dir)
-        .to_path_buf()
-}
-
-/// 배경 스레드에서 읽어온 트리 하위 목록 결과를 받아 반영한다. `show()` 시작
-/// 부분에서 매 프레임 호출한다 — 아직 아무것도 안 왔으면 그냥 넘어간다.
+/// 배경 스레드에서 읽어온 하위 목록 결과를 받아 반영한다. `show()` 시작
+/// 부분에서 매 프레임 호출한다 — 아직 아무것도 안 왔으면 그냥 넘어간다. 그새
+/// 접었거나 다른 폴더로 이동해서 더 이상 펼쳐져 있지 않은 폴더의 결과는 버린다
+/// (나중에 다시 펼칠 때 오래된 내용이 보이지 않게).
 fn drain_tree_loads(state: &mut FilePanelState) {
     while let Ok((path, children)) = state.tree_rx.try_recv() {
-        state.tree_children.insert(path, TreeChildren::Loaded(children));
+        if state.tree_expanded.contains(&path) {
+            state.tree_children.insert(path, TreeChildren::Loaded(children));
+        }
     }
 }
 
-/// 어떤 폴더의 "폴더만" 목록 읽기를 배경 스레드에서 시작한다(이미 읽는 중이거나
-/// 다 읽었으면 아무것도 안 함 — 여러 프레임에 걸쳐 반복 호출해도 안전). UI
-/// 스레드는 절대 디스크를 읽지 않는다 — 시스템 임시 폴더처럼 항목이 아주 많은
-/// 폴더를 펼쳤을 때 프레임이 멈추는 걸 실측으로 확인했다(5000행 렌더링 성능
-/// 테스트가 178ms까지 튀는 걸로 드러남). 심볼릭 링크는 대상을 따라가서 판단한다
-/// (`fsview::read_dir_sorted`와 같은 방침 — 링크 폴더가 파일로 잘못 분류돼 트리에서
-/// 열 수 없게 되는 걸 막음, TR-006 회귀).
+/// 폴더 하나의 하위 항목 읽기를 배경 스레드에서 시작한다(이미 읽는 중이거나 다
+/// 읽었으면 아무것도 안 함). 정렬·심볼릭 링크 처리는 현재 폴더 목록과 똑같아야
+/// 해서 core의 `read_dir_sorted`를 그대로 쓴다.
 fn spawn_tree_load(ctx: &egui::Context, state: &mut FilePanelState, path: &Path) {
     if state.tree_children.contains_key(path) {
         return;
@@ -527,120 +637,30 @@ fn spawn_tree_load(ctx: &egui::Context, state: &mut FilePanelState, path: &Path)
     let ctx = ctx.clone();
     let path = path.to_path_buf();
     std::thread::spawn(move || {
-        let mut children: Vec<PathBuf> = std::fs::read_dir(&path)
-            .map(|read| {
-                read.flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.metadata().map(|m| m.is_dir()).unwrap_or(false))
-                    .collect()
-            })
-            .unwrap_or_default();
-        children.sort_by_key(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()));
-        // 실제 항목이 수천 개인 폴더(공유 임시 폴더, 잔뜩 쌓인 다운로드 폴더 등)를
-        // 자동으로 펼쳤을 때 트리 한 단계에 수천 행이 통째로 쏟아지는 걸 막는다 —
-        // 파일 목록(`show_rows`)과 달리 트리는 아직 가상 스크롤이 아니라서
-        // (중첩 구조라 더 복잡함) 상한이 없으면 그만큼 다 그린다.
-        const TREE_MAX_CHILDREN: usize = 500;
-        children.truncate(TREE_MAX_CHILDREN);
+        let children = syncshell_core::fsview::read_dir_sorted(&path).unwrap_or_default();
         let _ = tx.send((path, children));
         ctx.request_repaint();
     });
 }
 
-/// 탐색기가 새 경로로 옮겨갈 때 그 경로까지의 조상 체인을 트리에서 자동으로
-/// 펼쳐준다 — 그래야 지금 보고 있는 폴더가 트리 안에서 어디인지 바로 보인다.
-/// 같은 경로에 대해 매 프레임 반복하지 않는다(사용자가 손으로 접어둔 다른
-/// 폴더까지 되살리지 않기 위해).
-fn ensure_tree_expanded_to_current(state: &mut FilePanelState, current_dir: &Path) {
-    if state.tree_synced_for.as_deref() == Some(current_dir) {
-        return;
-    }
-    // [`tree_root`]와 같은 단계 수만큼만 편다 — 왜 전부가 아니라 일부만인지는
-    // 그쪽 문서 참고.
-    for ancestor in current_dir.ancestors().take(TREE_AUTO_EXPAND_LEVELS) {
-        state.tree_expanded.insert(ancestor.to_path_buf());
-    }
-    state.tree_synced_for = Some(current_dir.to_path_buf());
-}
-
-/// 트리 한 줄(펼침/접힘 화살표 + 폴더 이름) — 화살표는 펼침 상태만 토글하고,
-/// 이름을 누르면 그 폴더로 이동한다(우측 리스트와 동일한 폴더=단일 클릭 진입
-/// 규칙, DEV-015). 펼쳐진 폴더는 재귀적으로 자기 하위 폴더를 그린다.
-fn tree_node(
-    ui: &mut egui::Ui,
-    path: &Path,
-    current_dir: &Path,
-    state: &mut FilePanelState,
-    action: &mut Option<FileAction>,
-    depth: usize,
-) {
-    let expanded = state.tree_expanded.contains(path);
-    let is_current = path == current_dir;
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
-
-    ui.horizontal(|ui| {
-        ui.add_space(depth as f32 * 14.0);
-        let arrow = if expanded { "▼" } else { "▶" };
-        if ui.add(egui::Button::new(arrow).small().frame(false)).clicked() {
-            if expanded {
-                state.tree_expanded.remove(path);
-            } else {
-                state.tree_expanded.insert(path.to_path_buf());
-                spawn_tree_load(ui.ctx(), state, path);
-            }
-        }
-        let label = format!("📁 {name}");
-        let response = ui.add(egui::Button::selectable(is_current, label).truncate());
-        #[cfg(test)]
-        tests::record_tree_node_rect_for_test(path, response.rect);
-        if response.clicked() {
-            *action = Some(FileAction::Navigate(path.to_path_buf()));
-        }
-    });
-
-    if expanded {
-        spawn_tree_load(ui.ctx(), state, path);
-        match state.tree_children.get(path) {
-            Some(TreeChildren::Loaded(children)) => {
-                let children = children.clone();
-                for child in &children {
-                    tree_node(ui, child, current_dir, state, action, depth + 1);
-                }
-            }
-            Some(TreeChildren::Loading) | None => {
-                ui.horizontal(|ui| {
-                    ui.add_space((depth + 1) as f32 * 14.0);
-                    ui.weak("불러오는 중…");
-                });
-            }
-        }
+/// 화살표를 누르면 펼침/접기. 접을 때 읽어둔 내용도 버린다 — 다시 펼치면 새로
+/// 읽어서, 그동안 바뀐 내용이 보이게 한다(하위 폴더는 파일 감시 대상이 아님).
+fn toggle_tree_expanded(ctx: &egui::Context, state: &mut FilePanelState, path: &Path) {
+    if state.tree_expanded.remove(path) {
+        state.tree_children.remove(path);
+    } else {
+        state.tree_expanded.insert(path.to_path_buf());
+        spawn_tree_load(ctx, state, path);
     }
 }
 
-/// 확장자 기반 정적 아이콘(DEV-011/DEV-008 방침 — 셸 아이콘 추출 같은 플랫폼
-/// API를 직접 부르지 않는다). 목록에서 자주 보는 확장자 몇 개만 구분하고,
-/// 나머지는 범용 파일 아이콘으로 묶는다 — 확장자별 아이콘 테이블을 무한정
-/// 늘리는 건 관리 비용 대비 얻는 게 적다.
-fn entry_icon(is_dir: bool, name: &str) -> &'static str {
-    if is_dir {
-        return "📁";
-    }
-    let ext = Path::new(name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase());
-    match ext.as_deref() {
-        Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg") => "🖼️",
-        Some("zip" | "tar" | "gz" | "7z" | "rar" | "xz") => "🗜️",
-        Some("mp3" | "wav" | "flac" | "aac" | "m4a") => "🎵",
-        Some("mp4" | "mov" | "mkv" | "avi" | "webm") => "🎬",
-        Some("pdf") => "📕",
-        Some("md" | "txt") => "📄",
-        Some("rs" | "py" | "js" | "ts" | "go" | "c" | "cpp" | "h" | "java" | "sh") => "💻",
-        _ => "📄",
+/// 펼침 상태는 "지금 보고 있는 폴더" 기준이다 — 다른 폴더로 이동하면(클릭이든
+/// 터미널 cd 동기화든) 비운다.
+fn reset_tree_if_moved(state: &mut FilePanelState, current_dir: &Path) {
+    if state.tree_for.as_deref() != Some(current_dir) {
+        state.tree_expanded.clear();
+        state.tree_children.clear();
+        state.tree_for = Some(current_dir.to_path_buf());
     }
 }
 
@@ -816,15 +836,6 @@ mod format_tests {
         assert!(rendered.chars().next().unwrap().is_ascii_digit());
     }
 
-    #[test]
-    fn entry_icon_distinguishes_directories_and_known_extensions() {
-        assert_eq!(entry_icon(true, "anything"), "📁");
-        assert_eq!(entry_icon(false, "photo.PNG"), "🖼️", "대소문자 구분 없이 확장자를 봐야 함");
-        assert_eq!(entry_icon(false, "archive.zip"), "🗜️");
-        assert_eq!(entry_icon(false, "main.rs"), "💻");
-        assert_eq!(entry_icon(false, "no_extension"), "📄");
-    }
-
     /// DEV-005 Test plan: "C:\Windows\System32 같은 대용량 폴더에서 스크롤이
     /// 끊기지 않는지". 실제 디스크 I/O 없이(느리고 CI에서 들쭉날쭉해짐) `entries`를
     /// 직접 5000개로 채워서, 목록 전체를 매 프레임 그대로 그리는(가상 스크롤 없음)
@@ -874,38 +885,31 @@ mod format_tests {
         );
     }
 
-    /// 실사용 버그 리포트("탐색기에서 문서 제목과 수정 날짜가 겹쳐서 출력됨") 회귀
-    /// 테스트: 이름 컬럼에 할당된 `name_width`보다 긴 파일명이 잘리지 않고 그대로
-    /// 그려지면, 그 옆에 오른쪽 정렬로 그리는 크기/수정일 컬럼과 겹친다.
-    /// `Button::truncate()`가 빠져 있던 게 원인이었다 — 이제는 이름 컬럼 폭을
-    /// 넘어서지 않아야 한다. 실제 행이 쓰는 것과 같은 위젯 구성
-    /// (`allocate_ui_with_layout` + `entry_icon` + `Button::selectable().truncate()`)
-    /// 을 그대로 재현해서 확인한다.
+    /// 실사용 버그 리포트("문서 제목과 수정 날짜가 겹쳐서 출력")의 회귀 테스트:
+    /// 이름 칸 폭보다 긴 파일명은 말줄임으로 잘려 그 폭을 넘지 않아야 한다 —
+    /// 넘으면 옆에 오른쪽 정렬로 그리는 크기/수정일 열과 겹친다. 트리 보기의 실제
+    /// 줄이 쓰는 `name_galley`를 그대로 쓴다.
     #[test]
     fn long_filename_is_truncated_within_name_column_width() {
         let ctx = egui::Context::default();
         let name_width = 150.0f32;
-        let row_height = 20.0f32;
         let long_name = "이_파일은_이름이_아주아주아주아주아주아주아주아주아주아주_길다.txt";
 
-        let mut response_rect = egui::Rect::NOTHING;
+        let mut size = egui::Vec2::ZERO;
+        let mut rows = 0;
         let mut input = egui::RawInput::default();
         input.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 100.0)));
         let _ = ctx.run_ui(input, |ui| {
-            ui.allocate_ui_with_layout(
-                egui::vec2(name_width, row_height),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    let label = format!("{} {}", entry_icon(false, long_name), long_name);
-                    response_rect = ui.add(egui::Button::selectable(false, label).truncate()).rect;
-                },
-            );
+            let galley = name_galley(ui, long_name, name_width, Color32::WHITE);
+            size = galley.size();
+            rows = galley.rows.len();
         });
 
         assert!(
-            response_rect.width() <= name_width + 1.0, // 부동소수점 오차 약간 허용
-            "긴 파일명이 이름 컬럼 폭({name_width})을 넘어감: {response_rect:?} — 옆 컬럼(크기/수정일)과 겹칠 수 있음"
+            size.x <= name_width + 1.0, // 부동소수점 오차 약간 허용
+            "긴 파일명이 이름 칸 폭({name_width})을 넘어감: {size:?} — 옆 열(크기/수정일)과 겹칠 수 있음"
         );
+        assert_eq!(rows, 1, "긴 파일명이 여러 줄로 접힘 — 한 줄에서 말줄임으로 잘려야 함");
     }
 }
 
@@ -924,25 +928,6 @@ mod tests {
                 std::fs::write(base.join(n), b"x").unwrap();
             }
         }
-        base
-    }
-
-    /// 트리 관련 테스트 전용 — 일반 `temp_dir_with()`와 달리 우리가 통제하는
-    /// 폴더를 몇 단계 더 파고 들어가서 테스트 폴더를 만든다. 트리는 현재 폴더에서
-    /// 가까운 조상 몇 단계([`TREE_AUTO_EXPAND_LEVELS`])까지 자동으로 펼치는데,
-    /// OS 공유 임시 폴더 바로 밑에 만들면 그 조상 중 하나가 우리와 무관한 항목이
-    /// 수천 개인 공유 폴더가 돼버려서(실측: macOS에서 4879개) 트리가 감당 못 할
-    /// 만큼 부풀고 테스트 화면(600px) 밖으로 밀려나 클릭 위치를 못 찾는다 —
-    /// 우리만 쓰는 폴더를 몇 단계 파서 그 안에 두면 트리 뿌리가 항상 우리가
-    /// 통제하는(항목이 몇 개 안 되는) 폴더가 된다.
-    fn isolated_tree_test_dir(tag: &str) -> PathBuf {
-        let base = std::env::temp_dir()
-            .join("syncshell-tree-test-root")
-            .join("a")
-            .join("b")
-            .join(format!("{tag}-{}", std::process::id()));
-        std::fs::remove_dir_all(&base).ok();
-        std::fs::create_dir_all(&base).unwrap();
         base
     }
 
@@ -1050,12 +1035,20 @@ mod tests {
     /// `show()` 안의 파일 행 렌더링 지점에서만 호출된다(`#[cfg(test)]`). 이미
     /// 하나 기록해뒀으면 덮어쓰지 않는다 — 여러 항목 중 "첫 번째" 행의 위치만
     /// 필요하기 때문.
-    pub(super) fn record_row_rect_for_test(_path: &Path, rect: egui::Rect) {
+    pub(super) fn record_row_rect_for_test(path: &Path, rect: egui::Rect) {
         FIRST_ROW_RECT.with(|c| {
             if c.get().is_none() {
                 c.set(Some(rect));
             }
         });
+        ROW_RECTS.with(|m| m.borrow_mut().insert(path.to_path_buf(), rect));
+    }
+
+    thread_local! {
+        /// 항목 줄 각각의 실제 렌더 위치(경로별) — 펼친 하위 항목처럼 "첫 줄"이
+        /// 아닌 특정 줄을 겨냥할 때 쓴다.
+        static ROW_RECTS: std::cell::RefCell<std::collections::HashMap<PathBuf, egui::Rect>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
     }
 
     thread_local! {
@@ -1073,24 +1066,23 @@ mod tests {
     }
 
     thread_local! {
-        /// 트리 노드(폴더 이름 버튼) 각각의 실제 렌더 위치. "트리에서 폴더 클릭 시
-        /// 이동" 테스트가 이 자리를 겨냥한다.
-        static TREE_NODE_RECTS: std::cell::RefCell<std::collections::HashMap<PathBuf, egui::Rect>> =
+        /// 트리 보기에서 폴더 앞 펼침 화살표 각각의 실제 클릭 영역(DEV-022).
+        static CHEVRON_RECTS: std::cell::RefCell<std::collections::HashMap<PathBuf, egui::Rect>> =
             std::cell::RefCell::new(std::collections::HashMap::new());
     }
 
-    pub(super) fn record_tree_node_rect_for_test(path: &Path, rect: egui::Rect) {
-        TREE_NODE_RECTS.with(|m| m.borrow_mut().insert(path.to_path_buf(), rect));
+    pub(super) fn record_chevron_rect_for_test(path: &Path, rect: egui::Rect) {
+        CHEVRON_RECTS.with(|m| m.borrow_mut().insert(path.to_path_buf(), rect));
     }
 
     /// 첫 번째 항목 행이 실제로 어디 그려지는지, 실제 프로덕션 `show()`를 한 번
     /// 돌려서 알아낸다(클릭 없이 레이아웃만) — 레이아웃을 손으로 재현하지 않으므로
     /// 좌측 트리 컬럼이나 브레드크럼 줄바꿈 같은 변화에도 안 깨진다.
     fn find_first_row_pos(ctx: &egui::Context, fs: &FsView) -> egui::Pos2 {
-        find_first_row_pos_in_view(ctx, fs, ViewMode::List)
+        find_first_row_pos_in_view(ctx, fs, ViewMode::Tree)
     }
 
-    /// [`find_first_row_pos`]와 같지만 어느 뷰(목록/아이콘)로 그릴지 지정한다.
+    /// [`find_first_row_pos`]와 같지만 어느 뷰(트리/아이콘)로 그릴지 지정한다.
     /// 아이콘 뷰의 칸은(84×84, 목록 행과 달리 폭 전체가 클릭 영역이라 왼쪽에서
     /// 5px 지점도 언제나 칸 안쪽이라) 목록 행과 동일한 방식으로 위치를 찾을 수
     /// 있다.
@@ -1126,25 +1118,33 @@ mod tests {
         rect.center()
     }
 
-    /// 트리에서 특정 폴더 노드가 실제로 어디 그려지는지 알아낸다. 트리 하위 목록은
-    /// 배경 스레드에서 비동기로 읽어오므로(`spawn_tree_load`), 도착할 때까지 같은
-    /// `state`로 여러 프레임을 반복해서 그려본다 — 넘겨받은 `state`를 계속 재사용해야
-    /// 한다(매번 새 `FilePanelState`를 쓰면 펼침·캐시 상태가 프레임마다 초기화돼
-    /// 영원히 "불러오는 중"만 보임).
-    fn find_tree_node_pos(ctx: &egui::Context, fs: &FsView, state: &mut FilePanelState, target: &Path) -> egui::Pos2 {
+    /// 트리 보기에서 `target`의 펼침 화살표(`chevron == true`) 또는 줄이 실제로
+    /// 어디 그려지는지 알아낸다. 펼친 하위 목록은 배경 스레드에서 읽어오므로
+    /// (`spawn_tree_load`) 나타날 때까지 같은 `state`로 여러 프레임을 그려본다 —
+    /// 넘겨받은 `state`를 계속 써야 한다(새로 만들면 펼침 상태가 초기화됨).
+    fn find_tree_pos(
+        ctx: &egui::Context,
+        fs: &FsView,
+        state: &mut FilePanelState,
+        target: &Path,
+        chevron: bool,
+    ) -> egui::Pos2 {
         for _ in 0..200 {
-            TREE_NODE_RECTS.with(|m| m.borrow_mut().clear());
+            ROW_RECTS.with(|m| m.borrow_mut().clear());
+            CHEVRON_RECTS.with(|m| m.borrow_mut().clear());
             let mut probe = egui::RawInput::default();
             probe.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 600.0)));
             let _ = ctx.run_ui(probe, |ui| {
                 let _ = show(ui, fs, state, true);
             });
-            if let Some(rect) = TREE_NODE_RECTS.with(|m| m.borrow().get(target).copied()) {
-                return egui::pos2(rect.left() + 5.0, rect.center().y);
+            let map = if chevron { &CHEVRON_RECTS } else { &ROW_RECTS };
+            if let Some(rect) = map.with(|m| m.borrow().get(target).copied()) {
+                // 줄의 가운데는 화살표(왼쪽 끝)와 겹치지 않는다.
+                return rect.center();
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        panic!("트리에서 {target:?} 노드를 찾지 못함(시간 초과) — 배경 로딩이 너무 오래 걸리거나 노드가 안 나타남");
+        panic!("트리에서 {target:?}를 찾지 못함(시간 초과) — 배경 로딩이 너무 오래 걸리거나 줄이 안 나타남");
     }
 
     /// 지정한 화면 좌표에 마우스 버튼 press+release를 보낸다(secondary=true면
@@ -1383,29 +1383,57 @@ mod tests {
         );
     }
 
-    /// DEV-005 Test plan: "트리에서 폴더 클릭 시 우측 리스트 및 탐색기 현재
-    /// 경로가 정확히 따라가는지". 현재 폴더(`base`)는 자동으로 펼쳐져 있으므로
-    /// 그 하위 폴더(`sub`)가 트리에 나타나고, 그걸 클릭하면 Navigate 액션이
-    /// 나와야 한다.
+    /// DEV-022: 폴더 앞 화살표를 누르면 이동하지 않고 그 자리에서 하위 항목이
+    /// 펼쳐지고(배경 로딩), 펼쳐진 하위 폴더 줄을 누르면 그 폴더로 이동해야 한다.
+    /// 다시 누르면 접혀서 하위 줄이 사라진다.
     #[test]
-    fn tree_node_click_navigates_to_that_folder() {
-        let base = isolated_tree_test_dir("tree-nav");
+    fn tree_chevron_expands_in_place_and_child_click_navigates() {
+        let base = temp_dir_with("tree-expand", &["sub/", "sub/inner/", "sub/note.txt"]);
         let sub = base.join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(sub.join("marker.txt"), b"x").unwrap();
+        let inner = sub.join("inner");
         let fs = settled_view(&base);
         let ctx = egui::Context::default();
         let mut state = FilePanelState::default();
 
-        let sub_pos = find_tree_node_pos(&ctx, &fs, &mut state, &sub);
-        let action = click_at(&ctx, &fs, &mut state, sub_pos, false);
+        let chevron = find_tree_pos(&ctx, &fs, &mut state, &sub, true);
+        let expand_action = click_at(&ctx, &fs, &mut state, chevron, false);
+        assert_eq!(expand_action, None, "화살표를 눌렀는데 폴더로 이동해버림 — 펼치기만 해야 함");
+        assert!(state.tree_expanded.contains(&sub), "화살표를 눌렀는데 펼침 상태가 안 됨");
+
+        let inner_pos = find_tree_pos(&ctx, &fs, &mut state, &inner, false);
+        let note_seen = ROW_RECTS.with(|m| m.borrow().contains_key(&sub.join("note.txt")));
+        let action = click_at(&ctx, &fs, &mut state, inner_pos, false);
+
+        let chevron = find_tree_pos(&ctx, &fs, &mut state, &sub, true);
+        click_at(&ctx, &fs, &mut state, chevron, false);
+        let collapsed = !state.tree_expanded.contains(&sub);
 
         std::fs::remove_dir_all(&base).ok();
-        assert_eq!(
-            action,
-            Some(FileAction::Navigate(sub)),
-            "트리에서 하위 폴더 노드를 클릭했는데 Navigate 액션이 안 나옴"
-        );
+        assert!(note_seen, "펼친 폴더의 파일(note.txt)이 트리에 안 나옴 — 폴더뿐 아니라 파일도 보여야 함");
+        assert_eq!(action, Some(FileAction::Navigate(inner)), "펼친 하위 폴더 줄을 눌렀는데 Navigate가 안 나옴");
+        assert!(collapsed, "화살표를 다시 눌렀는데 안 접힘");
+    }
+
+    /// 펼침 상태는 지금 보는 폴더 기준 — 다른 폴더로 옮겨가면 비워져야 한다
+    /// (안 그러면 돌아왔을 때 예전 펼침과 오래된 하위 목록이 남아 있음).
+    #[test]
+    fn tree_expansion_resets_when_current_folder_changes() {
+        let mut state = FilePanelState::default();
+        let a = PathBuf::from("/a");
+        reset_tree_if_moved(&mut state, &a);
+        state.tree_expanded.insert(a.join("x"));
+        reset_tree_if_moved(&mut state, &a);
+        assert_eq!(state.tree_expanded.len(), 1, "같은 폴더인데 펼침이 초기화됨");
+        reset_tree_if_moved(&mut state, Path::new("/b"));
+        assert!(state.tree_expanded.is_empty(), "다른 폴더로 옮겼는데 펼침이 남아 있음");
+    }
+
+    #[test]
+    fn view_mode_round_trips_through_string_and_defaults_to_tree() {
+        for mode in [ViewMode::Tree, ViewMode::Icons] {
+            assert_eq!(ViewMode::parse(mode.as_str()), mode);
+        }
+        assert_eq!(ViewMode::parse("list"), ViewMode::Tree, "모르는/예전 값은 트리로");
     }
 
     /// macOS는 Cmd+C/Cmd+V, 그 외(Windows/Linux)는 Ctrl+Shift+C/V — `show()`의

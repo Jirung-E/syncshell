@@ -97,6 +97,8 @@ pub struct State {
 pub struct UiState {
     /// "dark" | "light"
     pub theme: String,
+    /// 탐색기 보기 방식 "tree" | "icons"
+    pub view: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -265,7 +267,7 @@ mod tests {
                 tabs: vec![TabState { path: PathBuf::from("/tmp") }, TabState { path: PathBuf::from("/") }],
                 active_tab: 1,
                 window: Some(WindowState { x: 10.0, y: 20.0, width: 1400.0, height: 800.0 }),
-                ui: UiState { theme: "light".to_string() },
+                ui: UiState { theme: "light".to_string(), view: "icons".to_string() },
             };
             save_state(&state).unwrap();
 

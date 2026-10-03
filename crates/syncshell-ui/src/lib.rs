@@ -5,7 +5,7 @@ mod font_fallback;
 mod terminal_widget;
 mod theme;
 
-use file_panel::{FileAction, FilePanelState};
+use file_panel::{FileAction, FilePanelState, ViewMode};
 use std::path::{Path, PathBuf};
 use syncshell_core::fsops;
 use syncshell_core::fsview::FsView;
@@ -326,6 +326,9 @@ pub struct SyncShellApp {
     panel_layout: PanelLayout,
     /// 다크/라이트(DEV-021). 앱 전역 하나 — `state.toml`의 `[ui] theme`으로 저장된다.
     theme: ThemeMode,
+    /// 탐색기 트리/아이콘 보기(DEV-022). 탭마다 다르면 탭을 옮길 때마다 모양이
+    /// 바뀌어 헷갈려서 앱 전역 하나 — `state.toml`의 `[ui] view`로 저장된다.
+    view_mode: ViewMode,
 }
 
 /// [`SyncShellApp::panel_layout`] 참고.
@@ -394,6 +397,7 @@ impl SyncShellApp {
             last_window_rect: None,
             panel_layout: PanelLayout::default(),
             theme,
+            view_mode: ViewMode::parse(&state.ui.view),
         }
     }
 
@@ -413,7 +417,10 @@ impl SyncShellApp {
                 width: r.width(),
                 height: r.height(),
             }),
-            ui: syncshell_core::session::UiState { theme: self.theme.as_str().to_string() },
+            ui: syncshell_core::session::UiState {
+                theme: self.theme.as_str().to_string(),
+                view: self.view_mode.as_str().to_string(),
+            },
         }
     }
 
@@ -595,11 +602,16 @@ impl eframe::App for SyncShellApp {
             PanelLayout::Stacked => egui::Panel::top("file_panel"),
         };
         let default_size = match self.panel_layout {
-            PanelLayout::Side => 320.0,
+            // 트리 보기의 이름·크기·수정일 열이 들어갈 폭(DEV-022)
+            PanelLayout::Side => 380.0,
             PanelLayout::Stacked => 220.0,
         };
         let file_panel = file_panel_base.resizable(true).default_size(default_size).show(ui, |ui| {
+            // 보기 방식은 앱 전역이라 패널에 넣어주고, 패널 안의 전환 버튼으로
+            // 바뀌었으면 다시 가져온다.
+            active.panel.view_mode = self.view_mode;
             action = file_panel::show(ui, &active.fs, &mut active.panel, panel_active);
+            self.view_mode = active.panel.view_mode;
         });
         if let Some(action) = action {
             active.handle_file_action(ui.ctx(), action);
@@ -750,6 +762,7 @@ mod tests {
             last_window_rect: None,
             panel_layout: PanelLayout::default(),
             theme: ThemeMode::Dark,
+            view_mode: ViewMode::Tree,
         };
         theme::apply(&ctx, ThemeMode::Dark);
         assert_eq!(ctx.global_style().visuals.panel_fill, theme::DARK.panel);
@@ -758,6 +771,9 @@ mod tests {
         assert_eq!(ctx.global_style().visuals.panel_fill, theme::LIGHT.panel, "라이트로 바꿨는데 패널 색이 그대로");
 
         assert_eq!(app.session_state().ui.theme, "light", "종료 시 저장할 상태에 테마 선택이 안 들어감");
+
+        app.view_mode = ViewMode::Icons;
+        assert_eq!(app.session_state().ui.view, "icons", "종료 시 저장할 상태에 보기 방식이 안 들어감(DEV-022)");
     }
 
     /// DEV-009: 탭 추가/전환/닫기의 인덱스 계산이 정확한지 — 실제 `Tab::new`(진짜
@@ -773,6 +789,7 @@ mod tests {
             last_window_rect: None,
             panel_layout: PanelLayout::default(),
             theme: ThemeMode::default(),
+            view_mode: ViewMode::Tree,
         };
         assert_eq!(app.tabs.len(), 1);
 
@@ -828,6 +845,7 @@ mod tests {
             last_window_rect: Some(egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(1200.0, 700.0))),
             panel_layout: PanelLayout::default(),
             theme: ThemeMode::default(),
+            view_mode: ViewMode::Tree,
         };
 
         app.on_exit();
