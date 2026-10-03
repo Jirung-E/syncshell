@@ -1065,8 +1065,10 @@ mod tests {
         /// 화면에 `needle`이 나타날 때까지 프레임을 돌리며 기다린다(최대 ~4초).
         /// 고정 프레임 수로 기다리면 테스트를 병렬로 돌릴 때(각자 PowerShell을
         /// 띄우므로 부하가 크다) 셸이 느려져 간헐적으로 실패한다.
+        /// `needle`이 화면에 나올 때까지 최대 5초(500프레임 × 10ms) 기다린다. 테스트를
+        /// 병렬로 돌리면 PowerShell 세션이 여럿 동시에 떠서 출력이 꽤 늦어질 수 있다(BUG-004).
         fn wait_for_row(&mut self, needle: &str) -> bool {
-            for _ in 0..200 {
+            for _ in 0..500 {
                 if self.find_row(needle).is_some() {
                     return true;
                 }
@@ -1392,7 +1394,11 @@ mod tests {
         h.session
             .write_input(b"1..80 | ForEach-Object { Write-Host \"line$_\" }\r")
             .expect("write");
-        h.run_frames(80, |_| {});
+        // 고정 프레임 수만 돌리면 테스트를 병렬로 돌릴 때(PowerShell 세션이 여럿
+        // 동시에 뜸) 출력이 덜 와서 스크롤백이 10줄도 안 쌓일 수 있다 — 그러면
+        // 아래 scroll_display(10)이 쌓인 만큼으로 잘려 엉뚱한 값이 나온다(Windows
+        // 병렬 실행에서 실측: 1줄만 쌓여 -8 대신 1). 마지막 줄이 보일 때까지 기다린다.
+        assert!(h.wait_for_row("line80"), "출력이 끝까지 안 옴:\n{}", h.dump_screen());
 
         let cell = h.cell_size();
         let pos = egui::Pos2::new(h.rect.left() + cell.x * 0.5, h.rect.top() + cell.y * 2.5);
