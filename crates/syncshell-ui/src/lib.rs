@@ -835,6 +835,10 @@ const CUSTOM_WINDOW_CONTROLS: bool = cfg!(not(target_os = "macos"));
 /// 창 가장자리에서 크기 조절이 잡히는 폭(DEV-024).
 const RESIZE_BORDER: f32 = 5.0;
 const STATUS_BAR_HEIGHT: f32 = 24.0;
+/// 터미널 안쪽 여백(DEV-025, 실사용 피드백: "콘솔 부분이 창 경계와 간격이 아예
+/// 없어서 보기 불편함"). 시안(위아래 14, 좌우 18)보다 조금 줄였다 — 여백만큼
+/// 터미널 칸 수가 줄어서.
+const TERMINAL_PADDING: egui::Margin = egui::Margin { left: 12, right: 8, top: 8, bottom: 6 };
 
 impl eframe::App for SyncShellApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -902,8 +906,10 @@ impl eframe::App for SyncShellApp {
             active.handle_file_action(ui.ctx(), action);
         }
 
+        // 터미널 안쪽 여백(DEV-025). 여백도 터미널 바탕색으로 칠해 한 덩어리로
+        // 보이게 한다 — 셀 그리드는 여백을 뺀 안쪽에만 깔린다.
         let central = egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
+            .frame(egui::Frame::NONE.fill(theme.palette().term.bg).inner_margin(TERMINAL_PADDING))
             .show(ui, |ui| {
                 if let Some(session) = &mut active.terminal {
                     active.terminal_widget.show(ui, session);
