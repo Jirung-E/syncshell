@@ -27,6 +27,10 @@ pub enum Icon {
     SplitStacked,
     /// 동기화(사슬 고리)
     Link,
+    /// 창 버튼(DEV-024)
+    Minimize,
+    Maximize,
+    Restore,
 }
 
 /// `rect` 안에 아이콘을 그린다. 좌표는 16×16 격자 기준으로 잡고 rect 크기에
@@ -98,6 +102,15 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             poly(&[(6.5, 9.5), (9.5, 6.5)], false);
             poly(&[(7.5, 4.5), (8.7, 3.3), (10.2, 2.8), (11.7, 3.3), (12.7, 4.3), (13.2, 5.8), (12.7, 7.3), (11.5, 8.5)], false);
             poly(&[(8.5, 11.5), (7.3, 12.7), (5.8, 13.2), (4.3, 12.7), (3.3, 11.7), (2.8, 10.2), (3.3, 8.7), (4.5, 7.5)], false);
+        }
+        // 창 버튼은 Windows 기본 창 버튼처럼 얇고 작게(16 격자의 가운데 10).
+        Icon::Minimize => poly(&[(3.0, 8.0), (13.0, 8.0)], false),
+        Icon::Maximize => {
+            painter.rect_stroke(Rect::from_min_max(p(3.0, 3.0), p(13.0, 13.0)), 0.0, stroke, egui::StrokeKind::Middle);
+        }
+        Icon::Restore => {
+            painter.rect_stroke(Rect::from_min_max(p(3.0, 5.0), p(11.0, 13.0)), 0.0, stroke, egui::StrokeKind::Middle);
+            poly(&[(5.0, 5.0), (5.0, 3.0), (13.0, 3.0), (13.0, 11.0), (11.0, 11.0)], false);
         }
         Icon::ChevronRight => poly(&[(6.5, 4.5), (10.0, 8.0), (6.5, 11.5)], false),
         Icon::ChevronDown => poly(&[(4.5, 6.5), (8.0, 10.0), (11.5, 6.5)], false),
@@ -204,4 +217,45 @@ pub fn paint_icon_button(ui: &egui::Ui, pal: &Palette, rect: Rect, resp: &egui::
     let fg = if resp.hovered() { pal.text } else { pal.muted };
     let icon_side = (rect.width() * 0.6).min(14.0);
     paint_icon(ui.painter(), Rect::from_center_size(rect.center(), vec2(icon_side, icon_side)), icon, fg);
+}
+
+/// 창 버튼으로 요청된 동작(DEV-024).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowAction {
+    Minimize,
+    ToggleMaximize,
+    Close,
+}
+
+/// 창 버튼 하나의 폭 — Windows 기본 창 버튼과 같은 46px.
+pub const WINDOW_BUTTON_W: f32 = 46.0;
+
+/// 탭 바 오른쪽 끝의 창 버튼 묶음(최소화 / 최대화·복원 / 닫기). OS 기본
+/// 타이틀바를 끈 Windows·Linux에서만 쓴다(macOS는 네이티브 신호등 버튼).
+/// `right_to_left` 레이아웃 안에서 부르면 닫기가 맨 오른쪽에 온다.
+pub fn window_controls(ui: &mut egui::Ui, pal: &Palette, maximized: bool) -> Option<WindowAction> {
+    let h = ui.available_height();
+    let mut picked = None;
+    let items = [
+        (Icon::Close, "닫기", WindowAction::Close),
+        (if maximized { Icon::Restore } else { Icon::Maximize }, if maximized { "이전 크기로" } else { "최대화" }, WindowAction::ToggleMaximize),
+        (Icon::Minimize, "최소화", WindowAction::Minimize),
+    ];
+    for (icon, tip, action) in items {
+        let (rect, resp) = ui.allocate_exact_size(vec2(WINDOW_BUTTON_W, h), egui::Sense::click());
+        let resp = resp.on_hover_text(tip);
+        let close = action == WindowAction::Close;
+        // 닫기 호버는 Windows 관례대로 빨강 바탕 + 흰 아이콘.
+        let (fill, fg) = match (resp.hovered(), close) {
+            (true, true) => (Color32::from_rgb(0xC4, 0x2B, 0x1C), Color32::WHITE),
+            (true, false) => (pal.hover, pal.text),
+            _ => (Color32::TRANSPARENT, pal.muted),
+        };
+        ui.painter().rect_filled(rect, 0.0, fill);
+        paint_icon(ui.painter(), Rect::from_center_size(rect.center(), vec2(14.0, 14.0)), icon, fg);
+        if resp.clicked() {
+            picked = Some(action);
+        }
+    }
+    picked
 }

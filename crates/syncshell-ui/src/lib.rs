@@ -516,6 +516,17 @@ impl SyncShellApp {
         let mut want_new_tab = false;
         let pal = self.theme.palette();
         let row_h = ui.available_height();
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+
+        // 탭 바 빈 곳 = 창 손잡이(DEV-024): 끌면 창 이동, 더블클릭하면 최대화
+        // 토글. 탭·버튼보다 먼저 등록해야 그것들이 위에 올라가 클릭을 먼저 받는다
+        // (겹치는 위젯은 나중에 등록된 쪽이 이김).
+        let bar = ui.interact(ui.max_rect(), ui.id().with("tab_bar_drag"), egui::Sense::click_and_drag());
+        if bar.double_clicked() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+        } else if bar.drag_started_by(egui::PointerButton::Primary) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
 
         // DEV-014: macOS는 투명 타이틀바(run()에서 설정) 위에 탭 바가 신호등
         // 버튼과 같은 줄에 뜬다 — 버튼 폭만큼 왼쪽을 비워야 겹치지 않는다.
@@ -528,7 +539,8 @@ impl SyncShellApp {
         // 남은 가로 폭을 전부 차지해서 뒤에 그리는 탭이 하나도 안 보였다(DEV-021
         // 작업 중 발견).
         const SEGMENT_W: f32 = 2.0 * 28.0 + 4.0;
-        let right_w = SEGMENT_W * 2.0 + 8.0 + ui.spacing().item_spacing.x;
+        let controls_w = if CUSTOM_WINDOW_CONTROLS { chrome::WINDOW_BUTTON_W * 3.0 + 8.0 } else { 0.0 };
+        let right_w = SEGMENT_W * 2.0 + 8.0 + controls_w + ui.spacing().item_spacing.x * 2.0;
         let tabs_w = (ui.available_width() - right_w).max(0.0);
         ui.allocate_ui_with_layout(
             egui::vec2(tabs_w, row_h),
@@ -553,7 +565,20 @@ impl SyncShellApp {
         );
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // right_to_left라 먼저 그린 게 맨 오른쪽 — 테마 전환이 끝에 온다.
+            // right_to_left라 먼저 그린 게 맨 오른쪽 — 창 버튼(있으면), 테마 전환 순.
+            if CUSTOM_WINDOW_CONTROLS {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                match chrome::window_controls(ui, pal, maximized) {
+                    Some(chrome::WindowAction::Minimize) => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                    Some(chrome::WindowAction::ToggleMaximize) => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized))
+                    }
+                    Some(chrome::WindowAction::Close) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                    None => {}
+                }
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.add_space(8.0);
+            }
             let picked = chrome::segmented(
                 ui,
                 pal,
@@ -593,6 +618,67 @@ impl SyncShellApp {
             self.close_tab(i);
         }
     }
+}
+
+/// 테두리 없는 창(DEV-024)의 가장자리 크기 조절. winit은 Windows에서 테두리를
+/// 끄면 비클라이언트 영역을 전부 앱 영역으로 덮어서(WM_NCCALCSIZE) OS 기본
+/// 가장자리 크기 조절이 없어진다 — 가장자리 [`RESIZE_BORDER`]px 안에서 커서를
+/// 바꾸고, 누르면 OS에 크기 조절을 넘긴다(`BeginResize`). 최대화·전체화면일 땐
+/// 크기 조절이 의미 없으니 안 한다.
+fn handle_edge_resize(ctx: &egui::Context, window: egui::Rect) {
+    let (maximized, fullscreen) =
+        ctx.input(|i| (i.viewport().maximized.unwrap_or(false), i.viewport().fullscreen.unwrap_or(false)));
+    if maximized || fullscreen {
+        return;
+    }
+    let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) else { return };
+    let Some(dir) = resize_direction(pos, window, RESIZE_BORDER) else { return };
+    use egui::{CursorIcon as C, ResizeDirection as D};
+    ctx.set_cursor_icon(match dir {
+        D::North => C::ResizeNorth,
+        D::South => C::ResizeSouth,
+        D::East => C::ResizeEast,
+        D::West => C::ResizeWest,
+        D::NorthEast => C::ResizeNorthEast,
+        D::NorthWest => C::ResizeNorthWest,
+        D::SouthEast => C::ResizeSouthEast,
+        D::SouthWest => C::ResizeSouthWest,
+    });
+    if ctx.input(|i| i.pointer.primary_pressed()) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+    }
+}
+
+/// `pos`가 창 가장자리 `border`px 안이면 어느 방향 크기 조절인지. 모서리는
+/// 잡기 쉽게 두 배 폭으로 본다(대각선 조절을 노리기 어려워서).
+fn resize_direction(pos: egui::Pos2, window: egui::Rect, border: f32) -> Option<egui::ResizeDirection> {
+    if !window.contains(pos) {
+        return None;
+    }
+    let corner = border * 2.0;
+    let near = |d: f32, b: f32| d <= b;
+    let (l, r, t, b) = (pos.x - window.left(), window.right() - pos.x, pos.y - window.top(), window.bottom() - pos.y);
+    use egui::ResizeDirection as D;
+    let dir = if near(t, corner) && near(l, corner) {
+        D::NorthWest
+    } else if near(t, corner) && near(r, corner) {
+        D::NorthEast
+    } else if near(b, corner) && near(l, corner) {
+        D::SouthWest
+    } else if near(b, corner) && near(r, corner) {
+        D::SouthEast
+    } else if near(t, border) {
+        D::North
+    } else if near(b, border) {
+        D::South
+    } else if near(l, border) {
+        D::West
+    } else if near(r, border) {
+        D::East
+    } else {
+        return None;
+    };
+    Some(dir)
 }
 
 struct TabCardOutput {
@@ -724,10 +810,21 @@ fn home_relative(path: &Path) -> String {
 /// 확인(스크린샷)에서 "너무 넓어짐" 피드백을 받고서 macOS 표준값으로
 /// 낮췄다 — "맥 기본 터미널의 타이틀이랑 같은 높이"라는 요청과 정확히 일치.
 const TAB_BAR_HEIGHT: f32 = 32.0;
+/// OS 기본 타이틀바를 끄고 창 버튼·이동·크기 조절을 직접 하는지(DEV-024).
+/// macOS는 투명 타이틀바 위에 네이티브 신호등 버튼을 그대로 쓴다(DEV-014).
+/// `cfg!`(상수)로 둬서 어느 플랫폼에서든 양쪽 코드가 컴파일되게 한다 — 이
+/// 저장소는 주로 macOS에서 개발해서, `#[cfg]`로 갈라두면 Windows 쪽 코드가
+/// 깨져도 모른다.
+const CUSTOM_WINDOW_CONTROLS: bool = cfg!(not(target_os = "macos"));
+/// 창 가장자리에서 크기 조절이 잡히는 폭(DEV-024).
+const RESIZE_BORDER: f32 = 5.0;
 const STATUS_BAR_HEIGHT: f32 = 24.0;
 
 impl eframe::App for SyncShellApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if CUSTOM_WINDOW_CONTROLS {
+            handle_edge_resize(ui.ctx(), ui.max_rect());
+        }
         // `default_size`가 아니라 `exact_size`를 써야 한다 — `default_size`는
         // 첫 프레임 초기값 힌트일 뿐 허용 범위를 그대로 열어두고(egui 소스
         // 확인: min/max range가 안 좁혀짐), 이후 프레임에서 내용(탭 한 줄) 쪽으로
@@ -735,9 +832,11 @@ impl eframe::App for SyncShellApp {
         // 보고했는데, 실사용 확인에서 여전히 얇았다 — `exact_size`는 범위를
         // 그 값 하나로 완전히 고정한다(`Rangef::point`).
         let pal = self.theme.palette();
+        // 창 버튼이 있으면 오른쪽 끝에 딱 붙어야 해서(Windows 관례 — 화면 모서리로
+        // 마우스를 던져도 닫기가 눌림) 오른쪽 여백을 없앤다.
         let chrome_frame = egui::Frame::NONE
             .fill(pal.chrome)
-            .inner_margin(egui::Margin::symmetric(8, 0))
+            .inner_margin(egui::Margin { left: 8, right: if CUSTOM_WINDOW_CONTROLS { 0 } else { 8 }, top: 0, bottom: 0 })
             .stroke(egui::Stroke::NONE);
         egui::Panel::top("tab_bar").exact_size(TAB_BAR_HEIGHT).frame(chrome_frame).show(ui, |ui| {
             // 탭 바 내용(`show_tab_bar`가 그리는 가로 한 줄)을 패널의 전체
@@ -900,6 +999,13 @@ pub fn run() -> eframe::Result<()> {
             .with_titlebar_buttons_shown(true);
     }
 
+    // DEV-024: Windows·Linux도 OS 기본 타이틀바를 끄고 탭 바가 그 자리를 대신한다
+    // (OS가 달라도 기본 모습은 같게). 창 버튼·이동·가장자리 크기 조절은 직접
+    // 처리한다(`show_tab_bar`, `handle_edge_resize`).
+    if CUSTOM_WINDOW_CONTROLS {
+        viewport = viewport.with_decorations(false);
+    }
+
     let native_options = eframe::NativeOptions {
         persist_window: false,
         viewport,
@@ -972,6 +1078,23 @@ mod tests {
             }]);
         }
         assert_eq!(app.active, 1, "두 번째 탭을 눌렀는데 전환되지 않음");
+    }
+
+    /// DEV-024: 가장자리·모서리 판정. 안쪽은 None, 가장자리는 해당 방향, 모서리는
+    /// 대각선(두 배 폭)이어야 한다.
+    #[test]
+    fn resize_direction_detects_edges_and_corners() {
+        use egui::ResizeDirection as D;
+        let w = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let at = |x: f32, y: f32| resize_direction(egui::pos2(x, y), w, 5.0);
+        assert_eq!(at(400.0, 300.0), None, "창 안쪽인데 크기 조절로 잡힘");
+        assert_eq!(at(400.0, 2.0), Some(D::North));
+        assert_eq!(at(400.0, 598.0), Some(D::South));
+        assert_eq!(at(1.0, 300.0), Some(D::West));
+        assert_eq!(at(799.0, 300.0), Some(D::East));
+        assert_eq!(at(8.0, 3.0), Some(D::NorthWest), "모서리는 가장자리 폭의 두 배까지 대각선");
+        assert_eq!(at(797.0, 595.0), Some(D::SouthEast));
+        assert_eq!(at(900.0, 300.0), None, "창 밖");
     }
 
     /// DEV-020/023: 분할 모양 선택이 `state.toml` 문자열로 왕복되는지.
