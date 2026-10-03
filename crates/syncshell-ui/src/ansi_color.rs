@@ -1,36 +1,16 @@
-// 색 테마 시스템은 예광탄 범위 밖 — 고정된 기본 팔레트 하나만 사용한다.
+// 터미널 셀 색 해석. 기본 배경/전경과 ANSI 16색은 테마가 정한다(DEV-021,
+// `theme::TermPalette`) — 256색 큐브/그레이스케일과 트루컬러는 테마와 무관.
+use crate::theme::TermPalette;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 use eframe::egui::Color32;
-
-pub const DEFAULT_BG: Color32 = Color32::from_rgb(0x1e, 0x1e, 0x1e);
-pub const DEFAULT_FG: Color32 = Color32::from_rgb(0xcc, 0xcc, 0xcc);
-
-const ANSI_16: [(u8, u8, u8); 16] = [
-    (0x00, 0x00, 0x00), // Black
-    (0xcd, 0x31, 0x31), // Red
-    (0x0d, 0xbc, 0x79), // Green
-    (0xe5, 0xe5, 0x10), // Yellow
-    (0x24, 0x72, 0xc8), // Blue
-    (0xbc, 0x3f, 0xbc), // Magenta
-    (0x11, 0xa8, 0xcd), // Cyan
-    (0xe5, 0xe5, 0xe5), // White
-    (0x80, 0x80, 0x80), // BrightBlack
-    (0xf1, 0x4c, 0x4c), // BrightRed
-    (0x23, 0xd1, 0x8b), // BrightGreen
-    (0xf5, 0xf5, 0x43), // BrightYellow
-    (0x3b, 0x8e, 0xea), // BrightBlue
-    (0xd6, 0x70, 0xd6), // BrightMagenta
-    (0x29, 0xb8, 0xdb), // BrightCyan
-    (0xff, 0xff, 0xff), // BrightWhite
-];
 
 fn rgb_to_color32(rgb: Rgb) -> Color32 {
     Color32::from_rgb(rgb.r, rgb.g, rgb.b)
 }
 
-fn indexed_to_color32(idx: u8) -> Color32 {
-    if let Some(&(r, g, b)) = ANSI_16.get(idx as usize) {
-        return Color32::from_rgb(r, g, b);
+fn indexed_to_color32(idx: u8, pal: &TermPalette) -> Color32 {
+    if let Some(&c) = pal.ansi.get(idx as usize) {
+        return c;
     }
     if (16..=231).contains(&idx) {
         // 6x6x6 색상 큐브 (xterm 표준 레벨)
@@ -47,15 +27,15 @@ fn indexed_to_color32(idx: u8) -> Color32 {
     Color32::from_rgb(level, level, level)
 }
 
-pub fn resolve_fg(color: Color) -> Color32 {
+pub fn resolve_fg(color: Color, pal: &TermPalette) -> Color32 {
     match color {
         Color::Named(NamedColor::Foreground | NamedColor::BrightForeground | NamedColor::DimForeground) => {
-            DEFAULT_FG
+            pal.fg
         }
-        Color::Named(NamedColor::Background) => DEFAULT_BG,
-        Color::Named(named) => named_to_color32(named),
+        Color::Named(NamedColor::Background) => pal.bg,
+        Color::Named(named) => named_to_color32(named, pal),
         Color::Spec(rgb) => rgb_to_color32(rgb),
-        Color::Indexed(idx) => indexed_to_color32(idx),
+        Color::Indexed(idx) => indexed_to_color32(idx, pal),
     }
 }
 
@@ -65,14 +45,14 @@ pub fn resolve_fg(color: Color) -> Color32 {
 /// 굵기를 표현한다 — iTerm2·Windows Terminal 등 대부분의 터미널이 쓰는 관례.
 /// 이게 없으면 `ls --color`, git diff 등의 굵은 강조가 색·굵기 둘 다 안 보여서
 /// "글자 굵기/색이 제대로 표현 안 됨"으로 체감된다(실사용 버그 리포트).
-pub fn resolve_fg_bold_aware(color: Color, bold: bool) -> Color32 {
+pub fn resolve_fg_bold_aware(color: Color, bold: bool, pal: &TermPalette) -> Color32 {
     if !bold {
-        return resolve_fg(color);
+        return resolve_fg(color, pal);
     }
     match color {
-        Color::Named(named) => resolve_fg(Color::Named(brighten_named(named))),
-        Color::Indexed(idx) if idx < 8 => resolve_fg(Color::Indexed(idx + 8)),
-        other => resolve_fg(other),
+        Color::Named(named) => resolve_fg(Color::Named(brighten_named(named)), pal),
+        Color::Indexed(idx) if idx < 8 => resolve_fg(Color::Indexed(idx + 8), pal),
+        other => resolve_fg(other, pal),
     }
 }
 
@@ -91,19 +71,19 @@ fn brighten_named(named: NamedColor) -> NamedColor {
     }
 }
 
-pub fn resolve_bg(color: Color) -> Color32 {
+pub fn resolve_bg(color: Color, pal: &TermPalette) -> Color32 {
     match color {
-        Color::Named(NamedColor::Background) => DEFAULT_BG,
+        Color::Named(NamedColor::Background) => pal.bg,
         Color::Named(NamedColor::Foreground | NamedColor::BrightForeground | NamedColor::DimForeground) => {
-            DEFAULT_FG
+            pal.fg
         }
-        Color::Named(named) => named_to_color32(named),
+        Color::Named(named) => named_to_color32(named, pal),
         Color::Spec(rgb) => rgb_to_color32(rgb),
-        Color::Indexed(idx) => indexed_to_color32(idx),
+        Color::Indexed(idx) => indexed_to_color32(idx, pal),
     }
 }
 
-fn named_to_color32(named: NamedColor) -> Color32 {
+fn named_to_color32(named: NamedColor, pal: &TermPalette) -> Color32 {
     use NamedColor::*;
     let idx = match named {
         Black | DimBlack => 0,
@@ -123,23 +103,25 @@ fn named_to_color32(named: NamedColor) -> Color32 {
         BrightCyan => 14,
         BrightWhite => 15,
         // Foreground/Background/Cursor/BrightForeground/DimForeground은 위에서 먼저 처리됨
-        _ => return DEFAULT_FG,
+        _ => return pal.fg,
     };
-    let (r, g, b) = ANSI_16[idx];
-    Color32::from_rgb(r, g, b)
+    pal.ansi[idx]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::DARK;
+
+    const P: &TermPalette = &DARK.term;
 
     /// 실사용 버그: BOLD 텍스트의 색이 일반 텍스트와 구분이 안 됨. 별도 굵은
     /// 폰트 weight 없이도, 일반(0-7) ANSI 색은 밝은(8-15) 계열로 승격돼야 한다.
     #[test]
     fn bold_promotes_named_colors_to_bright_variants() {
-        let normal_red = resolve_fg(Color::Named(NamedColor::Red));
-        let bright_red = resolve_fg(Color::Named(NamedColor::BrightRed));
-        let bold_red = resolve_fg_bold_aware(Color::Named(NamedColor::Red), true);
+        let normal_red = resolve_fg(Color::Named(NamedColor::Red), P);
+        let bright_red = resolve_fg(Color::Named(NamedColor::BrightRed), P);
+        let bold_red = resolve_fg_bold_aware(Color::Named(NamedColor::Red), true, P);
 
         assert_eq!(bold_red, bright_red, "굵은 빨강이 밝은 빨강으로 승격되지 않음");
         assert_ne!(bold_red, normal_red, "굵은 색이 일반 색과 구분이 안 됨");
@@ -147,30 +129,30 @@ mod tests {
 
     #[test]
     fn bold_promotes_indexed_colors_0_to_7() {
-        let bold = resolve_fg_bold_aware(Color::Indexed(2), true); // 2 = Green
-        let bright_green = resolve_fg(Color::Indexed(10)); // 10 = BrightGreen
+        let bold = resolve_fg_bold_aware(Color::Indexed(2), true, P); // 2 = Green
+        let bright_green = resolve_fg(Color::Indexed(10), P); // 10 = BrightGreen
         assert_eq!(bold, bright_green);
     }
 
     /// 이미 밝은 색이거나 팔레트 범위(8 이상) 밖이면 그대로 둔다 — 더 밝힐 데가 없다.
     #[test]
     fn bold_does_not_change_already_bright_or_indexed_colors() {
-        let already_bright = resolve_fg_bold_aware(Color::Named(NamedColor::BrightBlue), true);
-        assert_eq!(already_bright, resolve_fg(Color::Named(NamedColor::BrightBlue)));
+        let already_bright = resolve_fg_bold_aware(Color::Named(NamedColor::BrightBlue), true, P);
+        assert_eq!(already_bright, resolve_fg(Color::Named(NamedColor::BrightBlue), P));
 
-        let high_index = resolve_fg_bold_aware(Color::Indexed(200), true);
-        assert_eq!(high_index, resolve_fg(Color::Indexed(200)));
+        let high_index = resolve_fg_bold_aware(Color::Indexed(200), true, P);
+        assert_eq!(high_index, resolve_fg(Color::Indexed(200), P));
     }
 
     #[test]
     fn not_bold_leaves_color_unchanged() {
         let color = Color::Named(NamedColor::Cyan);
-        assert_eq!(resolve_fg_bold_aware(color, false), resolve_fg(color));
+        assert_eq!(resolve_fg_bold_aware(color, false, P), resolve_fg(color, P));
     }
 
     #[test]
     fn bold_does_not_affect_true_color_rgb() {
         let rgb = Color::Spec(Rgb { r: 12, g: 34, b: 56 });
-        assert_eq!(resolve_fg_bold_aware(rgb, true), resolve_fg(rgb), "트루컬러는 승격 대상이 아님");
+        assert_eq!(resolve_fg_bold_aware(rgb, true, P), resolve_fg(rgb, P), "트루컬러는 승격 대상이 아님");
     }
 }

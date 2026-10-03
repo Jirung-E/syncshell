@@ -85,6 +85,18 @@ pub struct State {
     pub tabs: Vec<TabState>,
     pub active_tab: usize,
     pub window: Option<WindowState>,
+    pub ui: UiState,
+}
+
+/// 사용자가 UI에서 고른 표시 설정(DEV-021~). 앱이 종료 때 덮어쓰는 값이라
+/// `config.toml`이 아니라 여기 둔다. core는 UI를 모르므로(architecture 규칙 1)
+/// 값은 문자열로만 들고, 해석은 UI 크레이트가 한다 — 모르는 값이면 UI 쪽이
+/// 기본값으로 돌아간다.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct UiState {
+    /// "dark" | "light"
+    pub theme: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -253,6 +265,7 @@ mod tests {
                 tabs: vec![TabState { path: PathBuf::from("/tmp") }, TabState { path: PathBuf::from("/") }],
                 active_tab: 1,
                 window: Some(WindowState { x: 10.0, y: 20.0, width: 1400.0, height: 800.0 }),
+                ui: UiState { theme: "light".to_string() },
             };
             save_state(&state).unwrap();
 
@@ -269,6 +282,18 @@ mod tests {
             save_state(&State::default()).unwrap();
             assert!(dir.join("state.toml").exists());
             assert!(!dir.join("state.toml.tmp").exists());
+        });
+    }
+
+    /// `[ui]` 섹션이 생기기 전에 저장된 state.toml도 그대로 읽혀야 한다 —
+    /// 업데이트 후 첫 실행에서 탭이 전부 날아가면 안 된다.
+    #[test]
+    fn state_without_ui_section_still_loads() {
+        with_syncshell_home(|dir| {
+            std::fs::write(dir.join("state.toml"), "active_tab = 0\n\n[[tabs]]\npath = \"/tmp\"\n").unwrap();
+            let state = load_state();
+            assert_eq!(state.tabs.len(), 1, "예전 형식 state.toml의 탭을 못 읽음");
+            assert_eq!(state.ui, UiState::default());
         });
     }
 

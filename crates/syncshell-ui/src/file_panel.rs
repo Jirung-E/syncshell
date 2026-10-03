@@ -195,11 +195,9 @@ pub fn show(ui: &mut egui::Ui, fs: &FsView, state: &mut FilePanelState, panel_ac
     breadcrumb(ui, &fs.current_dir, &mut action, state.clipboard.is_some());
 
     if let Some(msg) = state.status.clone() {
-        let color = if state.status_is_error {
-            egui::Color32::from_rgb(0xe0, 0x6c, 0x75)
-        } else {
-            egui::Color32::from_rgb(0x98, 0xc3, 0x79)
-        };
+        // 테마(DEV-021)를 따른다 — 고정 색이면 라이트 모드에서 연두색 안내
+        // 문구가 흰 바탕에 묻혀 안 읽힌다.
+        let color = if state.status_is_error { ui.visuals().error_fg_color } else { ui.visuals().strong_text_color() };
         let mut dismissed = false;
         ui.horizontal(|ui| {
             ui.colored_label(color, msg);
@@ -265,7 +263,7 @@ pub fn show(ui: &mut egui::Ui, fs: &FsView, state: &mut FilePanelState, panel_ac
                 }
             }
             if let Some(err) = &fs.error {
-                ui.colored_label(egui::Color32::from_rgb(0xe0, 0x6c, 0x75), err);
+                ui.colored_label(ui.visuals().error_fg_color, err);
             }
 
             match state.view_mode {

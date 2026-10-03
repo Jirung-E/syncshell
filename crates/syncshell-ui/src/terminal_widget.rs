@@ -1,8 +1,9 @@
-use crate::ansi_color::{resolve_bg, resolve_fg_bold_aware, DEFAULT_BG};
+use crate::ansi_color::{resolve_bg, resolve_fg_bold_aware};
+use crate::theme::ThemeMode;
 use crate::font_fallback::FontFallback;
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::term::cell::Flags;
-use eframe::egui::{self, Color32, FontId, Pos2, Rect, Vec2};
+use eframe::egui::{self, FontId, Pos2, Rect, Vec2};
 use syncshell_core::terminal::TerminalSession;
 
 pub struct TerminalWidget {
@@ -29,6 +30,10 @@ pub struct TerminalWidget {
     /// 않고 화면에만 그린다** — 확정(`ImeEvent::Commit`) 시점에만 전송한다.
     /// 비어 있으면 조합 중이 아니다.
     preedit: String,
+    /// 셀 색을 정하는 테마(DEV-021). 앱이 테마를 바꾸면 `set_theme`으로 알려준다
+    /// — `show()` 인자로 받지 않는 건, `show()`를 부르는 Windows 전용 테스트가
+    /// 많아서(이 머신에서 컴파일 확인 불가) 시그니처를 건드리지 않기 위해서다.
+    theme: ThemeMode,
 }
 
 impl TerminalWidget {
@@ -40,7 +45,12 @@ impl TerminalWidget {
             last_scan_key: None,
             scans_run: 0,
             preedit: String::new(),
+            theme: ThemeMode::default(),
         }
+    }
+
+    pub fn set_theme(&mut self, theme: ThemeMode) {
+        self.theme = theme;
     }
 
     /// 사전 스캔을 실제로 돌린 누적 횟수 — 테스트에서 "안 바뀐 프레임은
@@ -339,8 +349,9 @@ impl TerminalWidget {
             }
         }
 
+        let pal = &self.theme.palette().term;
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, DEFAULT_BG);
+        painter.rect_filled(rect, 0.0, pal.bg);
 
         let content = session.term.renderable_content();
         // alacritty_terminal의 display_iter/cursor는 grid 좌표(스크롤 안 된 활성
@@ -379,12 +390,13 @@ impl TerminalWidget {
             // 보이게 한다 — 없으면(시스템에 굵은 face 자체가 없는 폰트) 기존
             // 대로 색만 밝게.
             let bold = flags.contains(Flags::BOLD);
-            let bright_fg = resolve_fg_bold_aware(fg, bold);
-            let (bg_color, fg_color) = if selected { (bright_fg, resolve_bg(bg)) } else { (resolve_bg(bg), bright_fg) };
+            let bright_fg = resolve_fg_bold_aware(fg, bold, pal);
+            let (bg_color, fg_color) =
+                if selected { (bright_fg, resolve_bg(bg, pal)) } else { (resolve_bg(bg, pal), bright_fg) };
             let glyph_font_id =
                 if bold { self.bold_font_id.clone().unwrap_or_else(|| self.font_id.clone()) } else { self.font_id.clone() };
 
-            if bg_color != DEFAULT_BG {
+            if bg_color != pal.bg {
                 painter.rect_filled(Rect::from_min_size(Pos2::new(x, y), Vec2::new(width, cell.y)), 0.0, bg_color);
             }
 
@@ -406,7 +418,7 @@ impl TerminalWidget {
             painter.rect_stroke(
                 cursor_rect,
                 0.0,
-                egui::Stroke::new(1.5, Color32::from_rgb(0xff, 0xff, 0xff)),
+                egui::Stroke::new(1.5, pal.cursor),
                 egui::StrokeKind::Outside,
             );
 
@@ -438,8 +450,8 @@ impl TerminalWidget {
     fn draw_preedit(&self, painter: &egui::Painter, start: Pos2, cell: Vec2, clip: Rect) {
         use unicode_width::UnicodeWidthChar;
 
-        let bg = Color32::from_rgb(0x28, 0x2c, 0x34);
-        let fg = Color32::from_rgb(0xff, 0xff, 0xff);
+        let pal = self.theme.palette();
+        let (bg, fg) = (pal.selection, pal.selection_text);
         let mut x = start.x;
         for c in self.preedit.chars() {
             let cols = c.width().unwrap_or(1).max(1) as f32;

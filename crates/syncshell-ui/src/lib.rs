@@ -1,7 +1,9 @@
 mod ansi_color;
+mod chrome;
 mod file_panel;
 mod font_fallback;
 mod terminal_widget;
+mod theme;
 
 use file_panel::{FileAction, FilePanelState};
 use std::path::{Path, PathBuf};
@@ -10,6 +12,7 @@ use syncshell_core::fsview::FsView;
 use syncshell_core::sync::SyncState;
 use syncshell_core::terminal::TerminalSession;
 use terminal_widget::TerminalWidget;
+use theme::ThemeMode;
 
 /// 탭 하나 — 독립된 (탐색기 + 터미널 세션 + 동기화 상태) 묶음(DEV-009).
 ///
@@ -321,6 +324,8 @@ pub struct SyncShellApp {
     /// 있게"). 탭마다 다르면 탭 전환할 때마다 레이아웃이 바뀌어 오히려 헷갈려서
     /// 세션 전체에 하나만 둔다(탭별이 아님).
     panel_layout: PanelLayout,
+    /// 다크/라이트(DEV-021). 앱 전역 하나 — `state.toml`의 `[ui] theme`으로 저장된다.
+    theme: ThemeMode,
 }
 
 /// [`SyncShellApp::panel_layout`] 참고.
@@ -379,12 +384,43 @@ impl SyncShellApp {
         }
         let active = state.active_tab.min(tabs.len() - 1);
 
+        let theme = ThemeMode::parse(&state.ui.theme);
+        theme::apply(&cc.egui_ctx, theme);
+
         Self {
             tabs,
             active,
             default_shell: config.default_shell,
             last_window_rect: None,
             panel_layout: PanelLayout::default(),
+            theme,
+        }
+    }
+
+    /// 종료 시 `state.toml`에 쓸 내용(DEV-010). `on_exit`과 분리해둔 건 저장
+    /// 내용을 파일을 거치지 않고 테스트하기 위해서다.
+    fn session_state(&self) -> syncshell_core::session::State {
+        syncshell_core::session::State {
+            tabs: self
+                .tabs
+                .iter()
+                .map(|t| syncshell_core::session::TabState { path: t.fs.current_dir.clone() })
+                .collect(),
+            active_tab: self.active,
+            window: self.last_window_rect.map(|r| syncshell_core::session::WindowState {
+                x: r.min.x,
+                y: r.min.y,
+                width: r.width(),
+                height: r.height(),
+            }),
+            ui: syncshell_core::session::UiState { theme: self.theme.as_str().to_string() },
+        }
+    }
+
+    fn set_theme(&mut self, ctx: &egui::Context, theme: ThemeMode) {
+        if self.theme != theme {
+            self.theme = theme;
+            theme::apply(ctx, theme);
         }
     }
 
@@ -441,6 +477,21 @@ impl SyncShellApp {
             // right_to_left로 그리면 오른쪽부터 채워지고, 뒤이어 그리는 탭들은
             // (아래 left_to_right 그대로) 남은 공간을 왼쪽부터 채운다.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // right_to_left라 먼저 그린 게 맨 오른쪽 — 테마 전환이 끝에 온다.
+                let pal = self.theme.palette();
+                let picked = chrome::segmented(
+                    ui,
+                    pal,
+                    &[
+                        (chrome::Icon::Moon, "다크 모드", self.theme == ThemeMode::Dark),
+                        (chrome::Icon::Sun, "라이트 모드", self.theme == ThemeMode::Light),
+                    ],
+                );
+                match picked {
+                    Some(0) => self.set_theme(ctx, ThemeMode::Dark),
+                    Some(1) => self.set_theme(ctx, ThemeMode::Light),
+                    _ => {}
+                }
                 if ui.button(self.panel_layout.toggle_label()).clicked() {
                     self.panel_layout = self.panel_layout.toggled();
                 }
@@ -503,7 +554,12 @@ impl eframe::App for SyncShellApp {
         // 다시 줄어들 수 있다. 처음엔 이걸 몰라서 default_size로 고쳤다고
         // 보고했는데, 실사용 확인에서 여전히 얇았다 — `exact_size`는 범위를
         // 그 값 하나로 완전히 고정한다(`Rangef::point`).
-        egui::Panel::top("tab_bar").exact_size(TAB_BAR_HEIGHT).show(ui, |ui| {
+        let pal = self.theme.palette();
+        let chrome_frame = egui::Frame::NONE
+            .fill(pal.chrome)
+            .inner_margin(egui::Margin::symmetric(8, 0))
+            .stroke(egui::Stroke::NONE);
+        egui::Panel::top("tab_bar").exact_size(TAB_BAR_HEIGHT).frame(chrome_frame).show(ui, |ui| {
             // 탭 바 내용(`show_tab_bar`가 그리는 가로 한 줄)을 패널의 전체
             // 높이 안에서 세로 가운데 정렬한다 — 안 그러면 내용이 패널 맨
             // 위에 붙어 그려지고 아래쪽 여백만 늘어나 신호등 버튼과 높이가
@@ -524,7 +580,9 @@ impl eframe::App for SyncShellApp {
             }
         }
 
+        let theme = self.theme;
         let active = &mut self.tabs[self.active];
+        active.terminal_widget.set_theme(theme);
 
         let mut action = None;
         let panel_active = active.active_panel == ActivePanel::Explorer;
@@ -593,20 +651,7 @@ impl eframe::App for SyncShellApp {
     /// DEV-010: 종료 시 열린 탭(경로)·활성 탭·창 위치/크기를 `state.toml`에
     /// 저장한다. `config.toml`(사람이 쓰는 설정)은 여기서 절대 건드리지 않는다.
     fn on_exit(&mut self) {
-        let state = syncshell_core::session::State {
-            tabs: self
-                .tabs
-                .iter()
-                .map(|t| syncshell_core::session::TabState { path: t.fs.current_dir.clone() })
-                .collect(),
-            active_tab: self.active,
-            window: self.last_window_rect.map(|r| syncshell_core::session::WindowState {
-                x: r.min.x,
-                y: r.min.y,
-                width: r.width(),
-                height: r.height(),
-            }),
-        };
+        let state = self.session_state();
         if let Err(e) = syncshell_core::session::save_state(&state) {
             // 저장 실패는 조용히 무시한다 — 세션 복원은 편의 기능이지, 이것
             // 때문에 종료 자체가 막히거나 사용자에게 강제로 뭘 시키면 안 된다.
@@ -692,6 +737,29 @@ mod tests {
         assert_eq!(stacked.toggle_label(), "레이아웃: 좌우로", "상하 상태의 버튼 라벨이 '좌우로 바꾸기'를 안내하지 않음");
     }
 
+    /// DEV-021: 테마를 바꾸면 egui 위젯 색(패널 바탕)이 실제로 바뀌고, 종료 시
+    /// 저장할 상태에 그 선택이 들어가야 한다(다음 실행에서 복원되는 근거 —
+    /// 파일 쓰기 자체는 `on_exit_saves_tabs_and_active_index_to_state_toml`이 본다).
+    #[test]
+    fn switching_theme_updates_visuals_and_is_saved_on_exit() {
+        let ctx = egui::Context::default();
+        let mut app = SyncShellApp {
+            tabs: vec![Tab::new(&ctx, std::env::temp_dir(), None)],
+            active: 0,
+            default_shell: None,
+            last_window_rect: None,
+            panel_layout: PanelLayout::default(),
+            theme: ThemeMode::Dark,
+        };
+        theme::apply(&ctx, ThemeMode::Dark);
+        assert_eq!(ctx.global_style().visuals.panel_fill, theme::DARK.panel);
+
+        app.set_theme(&ctx, ThemeMode::Light);
+        assert_eq!(ctx.global_style().visuals.panel_fill, theme::LIGHT.panel, "라이트로 바꿨는데 패널 색이 그대로");
+
+        assert_eq!(app.session_state().ui.theme, "light", "종료 시 저장할 상태에 테마 선택이 안 들어감");
+    }
+
     /// DEV-009: 탭 추가/전환/닫기의 인덱스 계산이 정확한지 — 실제 `Tab::new`(진짜
     /// 셸을 스폰함)로 확인한다. 오프바이원 실수가 나기 쉬운 영역이라 직접 검증.
     #[test]
@@ -704,6 +772,7 @@ mod tests {
             default_shell: None,
             last_window_rect: None,
             panel_layout: PanelLayout::default(),
+            theme: ThemeMode::default(),
         };
         assert_eq!(app.tabs.len(), 1);
 
@@ -758,6 +827,7 @@ mod tests {
             default_shell: None,
             last_window_rect: Some(egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(1200.0, 700.0))),
             panel_layout: PanelLayout::default(),
+            theme: ThemeMode::default(),
         };
 
         app.on_exit();
