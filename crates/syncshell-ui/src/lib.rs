@@ -378,6 +378,22 @@ enum PanelLayout {
 }
 
 impl PanelLayout {
+    /// 탐색기 패널(실사용 요청: "위|아래로도 배치할 수 있게") — 좌우일 땐 폭을,
+    /// 상하일 땐 높이를 드래그로 조절한다.
+    ///
+    /// id를 방향마다 따로 둬야 한다(BUG-005). egui는 패널 크기를 id별로 기억하는데,
+    /// 같은 id를 쓰면 좌우 모드에서 기억한 rect(높이 = 창 전체)를 상하 모드의 위쪽
+    /// 패널이 그대로 높이로 읽어 창 전체를 차지해서, 터미널이 통째로 사라졌다.
+    /// 따로 두면 방향마다 사용자가 조절해둔 크기도 각각 유지된다.
+    fn file_panel(self) -> egui::Panel {
+        match self {
+            // 트리 보기의 이름·크기·수정일 열이 들어갈 폭(DEV-022)
+            Self::Side => egui::Panel::left("file_panel_side").default_size(380.0),
+            Self::Stacked => egui::Panel::top("file_panel_stacked").default_size(220.0),
+        }
+        .resizable(true)
+    }
+
     /// `state.toml`의 `[ui] layout` 값.
     fn as_str(self) -> &'static str {
         match self {
@@ -875,20 +891,7 @@ impl eframe::App for SyncShellApp {
 
         let mut action = None;
         let panel_active = active.active_panel == ActivePanel::Explorer;
-        // 레이아웃 방향(실사용 요청: "위|아래로도 배치할 수 있게") — 좌우일 땐
-        // 폭을, 상하일 땐 높이를 드래그로 조절한다. `Panel::left`/`Panel::top`
-        // 둘 다 같은 빌더 API(`resizable`/`default_size`/`show`)를 쓰므로 어느
-        // 쪽으로 만들지만 갈라주면 나머지는 공통이다.
-        let file_panel_base = match self.panel_layout {
-            PanelLayout::Side => egui::Panel::left("file_panel"),
-            PanelLayout::Stacked => egui::Panel::top("file_panel"),
-        };
-        let default_size = match self.panel_layout {
-            // 트리 보기의 이름·크기·수정일 열이 들어갈 폭(DEV-022)
-            PanelLayout::Side => 380.0,
-            PanelLayout::Stacked => 220.0,
-        };
-        let file_panel = file_panel_base.resizable(true).default_size(default_size).show(ui, |ui| {
+        let file_panel = self.panel_layout.file_panel().show(ui, |ui| {
             // 보기 방식은 앱 전역이라 패널에 넣어주고, 패널 안의 전환 버튼으로
             // 바뀌었으면 다시 가져온다.
             active.panel.view_mode = self.view_mode;
@@ -1095,6 +1098,37 @@ mod tests {
         assert_eq!(at(8.0, 3.0), Some(D::NorthWest), "모서리는 가장자리 폭의 두 배까지 대각선");
         assert_eq!(at(797.0, 595.0), Some(D::SouthEast));
         assert_eq!(at(900.0, 300.0), None, "창 밖");
+    }
+
+    /// BUG-005: 좌우 → 상하로 바꿔도 터미널(가운데 패널) 자리가 남아 있어야 한다.
+    /// 실제 앱과 같은 `file_panel()` + `CentralPanel` 구성으로 두 방향을 차례로 그려본다.
+    #[test]
+    fn switching_split_direction_keeps_room_for_terminal() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        // 패널 크기는 첫 프레임 뒤에 정착하므로 방향마다 몇 프레임 그린 뒤 마지막 값을 본다.
+        let frames = |layout: PanelLayout| {
+            let mut central = egui::Rect::NOTHING;
+            for _ in 0..3 {
+                let mut input = egui::RawInput::default();
+                input.screen_rect = Some(screen);
+                let _ = ctx.run_ui(input, |ui| {
+                    // 실제 탐색기처럼 패널을 꽉 채운다 — 내용이 작으면 패널이 최소
+                    // 크기로 줄어서 기억된 크기를 읽는 경로를 안 타 버그가 재현되지 않는다.
+                    layout.file_panel().show(ui, |ui| {
+                        ui.allocate_space(ui.available_size());
+                    });
+                    central = egui::CentralPanel::default().show(ui, |ui| ui.label("터미널")).response.rect;
+                });
+            }
+            central
+        };
+        let side = frames(PanelLayout::Side);
+        assert!(side.width() > 600.0, "좌우 모드에서 터미널 폭이 너무 좁음: {side:?}");
+        let stacked = frames(PanelLayout::Stacked);
+        assert!(stacked.height() > 400.0, "상하로 바꿨더니 터미널 자리가 사라짐: {stacked:?}");
+        let back = frames(PanelLayout::Side);
+        assert!(back.width() > 600.0, "다시 좌우로 돌아왔는데 터미널 폭이 이상함: {back:?}");
     }
 
     /// DEV-020/023: 분할 모양 선택이 `state.toml` 문자열로 왕복되는지.
