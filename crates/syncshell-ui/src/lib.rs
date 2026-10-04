@@ -1,6 +1,7 @@
 mod ansi_color;
 mod chrome;
 mod file_panel;
+mod profile;
 mod font_fallback;
 mod terminal_widget;
 mod theme;
@@ -344,6 +345,8 @@ pub struct SyncShellApp {
     /// 탐색기 트리/아이콘 보기(DEV-022). 탭마다 다르면 탭을 옮길 때마다 모양이
     /// 바뀌어 헷갈려서 앱 전역 하나 — `state.toml`의 `[ui] view`로 저장된다.
     view_mode: ViewMode,
+    /// `SYNCSHELL_PROFILE=1`일 때만 켜지는 성능 진단(BUG-006).
+    profiler: Option<profile::Profiler>,
 }
 
 /// [`Tab::sync_status`] 참고.
@@ -449,6 +452,7 @@ impl SyncShellApp {
             panel_layout: PanelLayout::parse(&state.ui.layout),
             theme,
             view_mode: ViewMode::parse(&state.ui.view),
+            profiler: profile::Profiler::from_env(),
         }
     }
 
@@ -782,7 +786,7 @@ fn tab_card(
 }
 
 /// 하단 상태바(DEV-023): 동기화 상태 · 현재 폴더 · 항목 수.
-fn status_bar(ui: &mut egui::Ui, pal: &theme::Palette, tab: &Tab) {
+fn status_bar(ui: &mut egui::Ui, pal: &theme::Palette, tab: &Tab, profile: Option<&str>) {
     let sync = tab.sync_status();
     let small = egui::FontId::proportional(11.5);
     ui.horizontal_centered(|ui| {
@@ -794,7 +798,11 @@ fn status_bar(ui: &mut egui::Ui, pal: &theme::Palette, tab: &Tab) {
         ui.add_space(8.0);
         ui.add(egui::Label::new(egui::RichText::new(home_relative(&tab.fs.current_dir)).font(small.clone()).color(pal.muted)).truncate());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(egui::RichText::new(format!("{}개 항목", tab.fs.entries.len())).font(small).color(pal.muted));
+            ui.label(egui::RichText::new(format!("{}개 항목", tab.fs.entries.len())).font(small.clone()).color(pal.muted));
+            if let Some(profile) = profile {
+                ui.add_space(12.0);
+                ui.add(egui::Label::new(egui::RichText::new(profile).font(small).color(pal.accent)).truncate());
+            }
         });
     });
 }
@@ -842,6 +850,10 @@ const TERMINAL_PADDING: egui::Margin = egui::Margin { left: 12, right: 8, top: 8
 
 impl eframe::App for SyncShellApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let profile_start = self
+            .profiler
+            .as_mut()
+            .map(|p| p.frame_start(ui.ctx().input(|i| i.events.len())));
         if CUSTOM_WINDOW_CONTROLS {
             handle_edge_resize(ui.ctx(), ui.max_rect());
         }
@@ -875,7 +887,7 @@ impl eframe::App for SyncShellApp {
             .inner_margin(egui::Margin::symmetric(12, 0))
             .stroke(egui::Stroke::new(1.0, pal.border));
         egui::Panel::bottom("status_bar").exact_size(STATUS_BAR_HEIGHT).frame(status_frame).show(ui, |ui| {
-            status_bar(ui, pal, &self.tabs[self.active]);
+            status_bar(ui, pal, &self.tabs[self.active], self.profiler.as_ref().map(|p| p.summary.as_str()));
         });
 
         // 활성 탭의 셸이 종료됐으면(예: exit 입력) 탭을 닫는다 — 탭이 하나뿐이면
@@ -942,6 +954,11 @@ impl eframe::App for SyncShellApp {
         // 여기 캐시해둔다 — 종료 시 이 마지막 값을 state.toml에 쓴다.
         if let Some(rect) = ui.ctx().input(|i| i.viewport().outer_rect) {
             self.last_window_rect = Some(rect);
+        }
+
+        if let (Some(profiler), Some(start)) = (self.profiler.as_mut(), profile_start) {
+            let io = self.tabs[self.active].terminal.as_mut().map(|t| t.take_io_stats()).unwrap_or_default();
+            profiler.frame_end(start, io);
         }
     }
 
@@ -1057,6 +1074,7 @@ mod tests {
             panel_layout: PanelLayout::default(),
             theme: ThemeMode::Dark,
             view_mode: ViewMode::Tree,
+            profiler: None,
         };
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, TAB_BAR_HEIGHT));
         let mut frame = |events: Vec<egui::Event>| {
@@ -1160,6 +1178,7 @@ mod tests {
             panel_layout: PanelLayout::default(),
             theme: ThemeMode::Dark,
             view_mode: ViewMode::Tree,
+            profiler: None,
         };
         theme::apply(&ctx, ThemeMode::Dark);
         assert_eq!(ctx.global_style().visuals.panel_fill, theme::DARK.panel);
@@ -1190,6 +1209,7 @@ mod tests {
             panel_layout: PanelLayout::default(),
             theme: ThemeMode::default(),
             view_mode: ViewMode::Tree,
+            profiler: None,
         };
         assert_eq!(app.tabs.len(), 1);
 
@@ -1246,6 +1266,7 @@ mod tests {
             panel_layout: PanelLayout::default(),
             theme: ThemeMode::default(),
             view_mode: ViewMode::Tree,
+            profiler: None,
         };
 
         app.on_exit();

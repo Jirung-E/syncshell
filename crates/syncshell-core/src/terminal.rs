@@ -41,6 +41,18 @@ impl Dimensions for TermSize {
     }
 }
 
+/// PTY 입출력 계측(BUG-006 진단). `take_io_stats()`로 꺼내면 0으로 돌아간다.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IoStats {
+    /// PTY 쓰기 한 번에 걸린 가장 긴 시간 — UI 스레드에서 쓰므로, 이게 길면
+    /// 쓰기가 막혀서 앱 전체가 멈추는 것이다.
+    pub max_write: Duration,
+    pub writes: u32,
+    /// PTY에서 읽어 처리한 바이트 수와, 그 처리(VT 파싱)에 쓴 시간.
+    pub bytes_read: u64,
+    pub parse_time: Duration,
+}
+
 /// PTY + alacritty_terminal 상태머신을 함께 묶어서 관리한다.
 /// UI 프레임워크는 모른다 — repaint 요청은 생성 시 넘겨준 콜백으로만 한다.
 pub struct TerminalSession {
@@ -95,6 +107,7 @@ pub struct TerminalSession {
     rx: mpsc::Receiver<PtyEvent>,
     cols: u16,
     rows: u16,
+    io_stats: IoStats,
 }
 
 /// 셸 실행 파일 이름만으로 종류를 가른다(전체 경로가 와도 마지막 조각만 본다 —
@@ -204,6 +217,7 @@ impl TerminalSession {
             rx,
             cols,
             rows,
+            io_stats: IoStats::default(),
         })
     }
 
@@ -248,9 +262,12 @@ impl TerminalSession {
                     on_data();
                 });
             }
+            let parse_start = Instant::now();
+            self.io_stats.bytes_read += data.len() as u64;
             for byte in data {
                 self.processor.advance(&mut self.term, byte);
             }
+            self.io_stats.parse_time += parse_start.elapsed();
             self.content_version = self.content_version.wrapping_add(1);
         }
 
@@ -288,7 +305,7 @@ impl TerminalSession {
     /// `pending_user_input` 상태에 영향을 주지 않는다 — 실제 사용자 타이핑이
     /// 아니기 때문. 주입 전에 `has_pending_user_input()`으로 안전한지 먼저 확인할 것.
     pub fn write_input(&mut self, data: &[u8]) -> Result<()> {
-        self.pty.write(data)
+        self.timed_write(data)
     }
 
     /// 실제 키보드 입력 경로(`TerminalWidget::show`)에서만 호출한다. 순수 Enter(`\r`
@@ -301,7 +318,22 @@ impl TerminalSession {
             self.command_running = true;
         }
         self.pending_user_input = data != b"\r";
-        self.pty.write(data)
+        self.timed_write(data)
+    }
+
+    /// PTY에 쓰고 걸린 시간을 계측한다(BUG-006 진단).
+    fn timed_write(&mut self, data: &[u8]) -> Result<()> {
+        let start = Instant::now();
+        let result = self.pty.write(data);
+        let elapsed = start.elapsed();
+        self.io_stats.max_write = self.io_stats.max_write.max(elapsed);
+        self.io_stats.writes += 1;
+        result
+    }
+
+    /// 마지막으로 꺼낸 뒤부터 쌓인 입출력 계측값을 꺼내고 0으로 되돌린다.
+    pub fn take_io_stats(&mut self) -> IoStats {
+        std::mem::take(&mut self.io_stats)
     }
 
     /// 지금 탐색기 클릭으로 인한 cd를 주입하면 사용자가 타이핑 중인 줄과 섞일 수
