@@ -1,6 +1,8 @@
 mod ansi_color;
 mod chrome;
 mod file_panel;
+#[cfg(test)]
+mod latency_probe;
 mod profile;
 mod font_fallback;
 mod terminal_widget;
