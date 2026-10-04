@@ -4,6 +4,7 @@ mod file_panel;
 #[cfg(test)]
 mod latency_probe;
 mod profile;
+mod selftest;
 mod font_fallback;
 mod terminal_widget;
 mod theme;
@@ -349,6 +350,8 @@ pub struct SyncShellApp {
     view_mode: ViewMode,
     /// `SYNCSHELL_PROFILE=1`일 때만 켜지는 성능 진단(BUG-006).
     profiler: Option<profile::Profiler>,
+    /// `SYNCSHELL_SELFTEST=keys`일 때만 켜지는 실제 창 자가 진단(BUG-006).
+    selftest: Option<selftest::SelfTest>,
 }
 
 /// [`Tab::sync_status`] 참고.
@@ -455,6 +458,7 @@ impl SyncShellApp {
             theme,
             view_mode: ViewMode::parse(&state.ui.view),
             profiler: profile::Profiler::from_env(),
+            selftest: selftest::SelfTest::from_env(),
         }
     }
 
@@ -851,7 +855,13 @@ const STATUS_BAR_HEIGHT: f32 = 24.0;
 const TERMINAL_PADDING: egui::Margin = egui::Margin { left: 12, right: 8, top: 8, bottom: 6 };
 
 impl eframe::App for SyncShellApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if let Some(t) = &mut self.selftest {
+            t.inject(raw_input);
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let profile_start = self
             .profiler
             .as_mut()
@@ -956,6 +966,13 @@ impl eframe::App for SyncShellApp {
         // 여기 캐시해둔다 — 종료 시 이 마지막 값을 state.toml에 쓴다.
         if let Some(rect) = ui.ctx().input(|i| i.viewport().outer_rect) {
             self.last_window_rect = Some(rect);
+        }
+
+        if let Some(t) = &mut self.selftest {
+            if let Some(report) = t.frame(ui.ctx(), frame, self.tabs[self.active].terminal.as_mut()) {
+                eprintln!("{report}");
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
 
         if let (Some(profiler), Some(start)) = (self.profiler.as_mut(), profile_start) {
@@ -1077,6 +1094,7 @@ mod tests {
             theme: ThemeMode::Dark,
             view_mode: ViewMode::Tree,
             profiler: None,
+            selftest: None,
         };
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, TAB_BAR_HEIGHT));
         let mut frame = |events: Vec<egui::Event>| {
@@ -1181,6 +1199,7 @@ mod tests {
             theme: ThemeMode::Dark,
             view_mode: ViewMode::Tree,
             profiler: None,
+            selftest: None,
         };
         theme::apply(&ctx, ThemeMode::Dark);
         assert_eq!(ctx.global_style().visuals.panel_fill, theme::DARK.panel);
@@ -1212,6 +1231,7 @@ mod tests {
             theme: ThemeMode::default(),
             view_mode: ViewMode::Tree,
             profiler: None,
+            selftest: None,
         };
         assert_eq!(app.tabs.len(), 1);
 
@@ -1269,6 +1289,7 @@ mod tests {
             theme: ThemeMode::default(),
             view_mode: ViewMode::Tree,
             profiler: None,
+            selftest: None,
         };
 
         app.on_exit();
