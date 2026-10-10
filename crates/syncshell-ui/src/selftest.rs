@@ -15,6 +15,7 @@
 //! 길면, 실제 키를 누를 때 OS 메시지 큐에 키 반복이 쌓여 "떼도 계속 입력됨"이 된다.
 
 use eframe::egui;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use syncshell_core::terminal::TerminalSession;
@@ -24,10 +25,14 @@ const REPEAT: Duration = Duration::from_millis(33);
 const WARMUP: Duration = Duration::from_secs(4);
 const TYPING: Duration = Duration::from_secs(3);
 const DRAIN_LIMIT: Duration = Duration::from_secs(10);
+/// OS 키 모드에서 창이 포커스를 받기를 기다리는 최대 시간.
+const FOCUS_WAIT_LIMIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Warmup,
+    /// OS 키 모드: 창이 포커스를 받을 때까지 기다림(사용자 클릭 안내)
+    WaitFocus,
     Typing,
     Drain,
     Done,
@@ -46,6 +51,13 @@ pub struct SelfTest {
     no_accesskit: bool,
     /// 키를 "보낸" 시각들 — OS 키 모드에선 별도 스레드가 채운다.
     sent_log: Arc<Mutex<Vec<Instant>>>,
+    /// 창이 지금 포커스를 가졌는지 — 키 보내는 스레드가 매번 확인해서, 포커스를
+    /// 잃으면 다른 창에 q가 들어가지 않게 즉시 멈춘다.
+    focused: Arc<AtomicBool>,
+    /// 키 보내는 스레드가 포커스를 잃어 중단했음
+    focus_lost: Arc<AtomicBool>,
+    /// 측정이 무효인 이유(포커스 못 받음 등)
+    invalid: Option<&'static str>,
     phase: Phase,
     phase_start: Instant,
     last_frame: Option<Instant>,
@@ -76,6 +88,9 @@ impl SelfTest {
             mode,
             no_accesskit,
             sent_log: Arc::new(Mutex::new(Vec::new())),
+            focused: Arc::new(AtomicBool::new(false)),
+            focus_lost: Arc::new(AtomicBool::new(false)),
+            invalid: None,
             phase: Phase::Warmup,
             phase_start: Instant::now(),
             last_frame: None,
@@ -136,18 +151,46 @@ impl SelfTest {
             self.adapter = format!("{} ({:?})", info.name, info.backend);
         }
         let visible = session.as_deref().map(count_visible).unwrap_or(0);
+        let has_focus = ctx.input(|i| i.viewport().focused.unwrap_or(false));
+        self.focused.store(has_focus, Ordering::Relaxed);
 
         match self.phase {
             Phase::Warmup => {
                 if self.phase_start.elapsed() >= WARMUP {
+                    self.phase_start = now;
+                    if self.mode == Mode::OsKeys {
+                        // SendInput은 포커스를 가진 창으로 간다. 띄운 쪽이 백그라운드
+                        // 프로세스면 Windows 포그라운드 잠금 때문에 새 창이 포커스를
+                        // 못 받을 수 있어(실측), 받을 때까지 기다린다.
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        self.phase = Phase::WaitFocus;
+                    } else {
+                        self.base_visible = visible;
+                        self.phase = Phase::Typing;
+                    }
+                }
+            }
+            Phase::WaitFocus => {
+                if has_focus {
                     self.base_visible = visible;
                     self.phase = Phase::Typing;
                     self.phase_start = now;
-                    if self.mode == Mode::OsKeys {
-                        // SendInput은 포커스를 가진 창으로 간다.
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                        spawn_os_key_repeat(self.sent_log.clone());
-                    }
+                    spawn_os_key_repeat(self.sent_log.clone(), self.focused.clone(), self.focus_lost.clone());
+                } else if self.phase_start.elapsed() >= FOCUS_WAIT_LIMIT {
+                    self.invalid = Some("창이 포커스를 받지 못함(30초) — 키를 보내지 않았음");
+                    self.phase = Phase::Done;
+                    return Some(self.report());
+                } else {
+                    let left = FOCUS_WAIT_LIMIT.saturating_sub(self.phase_start.elapsed()).as_secs();
+                    egui::Area::new(egui::Id::new("selftest_focus_hint"))
+                        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                        .order(egui::Order::Foreground)
+                        .show(ctx, |ui| {
+                            egui::Frame::popup(ui.style()).inner_margin(16).show(ui, |ui| {
+                                ui.heading("자가 진단 대기 중");
+                                ui.label(format!("이 창을 한 번 클릭하세요 — 클릭하면 키 입력 측정을 시작합니다 ({left}초)"));
+                            });
+                        });
                 }
             }
             Phase::Typing | Phase::Drain => {
@@ -162,6 +205,9 @@ impl SelfTest {
                 while self.seen < shown {
                     self.echo.push(sent[self.seen].elapsed());
                     self.seen += 1;
+                }
+                if self.focus_lost.load(Ordering::Relaxed) && self.invalid.is_none() {
+                    self.invalid = Some("측정 중 창이 포커스를 잃어 키 보내기를 멈춤 — 결과 일부만 유효");
                 }
                 if self.phase == Phase::Typing && self.phase_start.elapsed() >= TYPING {
                     self.phase = Phase::Drain;
@@ -194,6 +240,7 @@ impl SelfTest {
         let slow = self.intervals.iter().filter(|d| **d > REPEAT).count();
         format!(
             "=== 실제 창 자가 진단 ===\n\
+             {}\
              입력 방식: {}\n\
              GPU: {}\n\
              AccessKit(접근성 트리): {}\n\
@@ -203,6 +250,7 @@ impl SelfTest {
              보낸 글자 {} · 화면에 보인 글자 {}\n\
              에코 지연: 중앙 {:.1}ms · p95 {:.1}ms · 최대 {:.1}ms\n\
              입력 멈춘 뒤 따라잡기: {:.1}ms",
+            self.invalid.map(|r| format!("⚠ 측정 무효: {r}\n")).unwrap_or_default(),
             match self.mode {
                 Mode::Internal => "앱 내부 egui 이벤트(keys)",
                 Mode::OsKeys => "OS 키 입력 SendInput(oskeys)",
@@ -238,7 +286,7 @@ fn count_visible(session: &TerminalSession) -> usize {
 /// OS 키 반복 흉내(Windows): 3초간 33ms마다 Q keydown을 SendInput으로 보내고 끝에
 /// keyup. 키를 꾹 누르고 있을 때처럼 keyup 없이 keydown만 이어진다.
 #[cfg(windows)]
-fn spawn_os_key_repeat(log: Arc<Mutex<Vec<Instant>>>) {
+fn spawn_os_key_repeat(log: Arc<Mutex<Vec<Instant>>>, focused: Arc<AtomicBool>, focus_lost: Arc<AtomicBool>) {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP};
     fn key(up: bool) {
         let input = INPUT {
@@ -253,10 +301,15 @@ fn spawn_os_key_repeat(log: Arc<Mutex<Vec<Instant>>>) {
         }
     }
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(300)); // 포커스 이동 대기
+        std::thread::sleep(Duration::from_millis(100)); // 포커스가 확인된 직후라 짧게만 둔다
         let start = Instant::now();
         let mut next = start;
         while start.elapsed() < TYPING {
+            // 포커스를 잃었으면 즉시 멈춘다 — 안 그러면 q가 다른 창에 들어간다.
+            if !focused.load(Ordering::Relaxed) {
+                focus_lost.store(true, Ordering::Relaxed);
+                break;
+            }
             if let Ok(mut v) = log.lock() {
                 v.push(Instant::now());
             }
@@ -269,4 +322,4 @@ fn spawn_os_key_repeat(log: Arc<Mutex<Vec<Instant>>>) {
 }
 
 #[cfg(not(windows))]
-fn spawn_os_key_repeat(_log: Arc<Mutex<Vec<Instant>>>) {}
+fn spawn_os_key_repeat(_log: Arc<Mutex<Vec<Instant>>>, _focused: Arc<AtomicBool>, _focus_lost: Arc<AtomicBool>) {}
