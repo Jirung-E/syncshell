@@ -516,7 +516,9 @@ fn name_galley(ui: &egui::Ui, name: &str, max_width: f32, color: Color32) -> Arc
 /// 올림).
 fn icon_view(ui: &mut egui::Ui, fs: &FsView, state: &mut FilePanelState, action: &mut Option<FileAction>) {
     const CELL_SIZE: egui::Vec2 = egui::vec2(84.0, 84.0);
-    let cols = ((ui.available_width() / CELL_SIZE.x).floor() as usize).max(1);
+    // 스크롤바가 내용 위에 겹치지 않고 자리를 차지하는 설정이면 그만큼 뺀다.
+    let width = ui.available_width() - ui.spacing().scroll.allocated_width();
+    let cols = icon_columns(width, CELL_SIZE.x, ui.spacing().item_spacing.x);
     let row_count = fs.entries.len().div_ceil(cols);
 
     egui::ScrollArea::vertical()
@@ -532,6 +534,14 @@ fn icon_view(ui: &mut egui::Ui, fs: &FsView, state: &mut FilePanelState, action:
                 });
             }
         });
+}
+
+/// 한 줄에 들어가는 아이콘 칸 수(BUG-008). 칸 사이에 `spacing`이 들어가므로
+/// `n`칸의 폭은 `n·cell + (n−1)·spacing` — 마지막 칸의 오른쪽 끝까지 `width` 안에
+/// 들어가는 최대 `n`을 고른다. 예전엔 `width / cell`로만 계산해 간격만큼 넘쳐서
+/// 줄 끝 아이콘이 잘렸다. 폭이 칸 하나보다 좁아도 최소 1칸.
+fn icon_columns(width: f32, cell: f32, spacing: f32) -> usize {
+    (((width + spacing) / (cell + spacing)).floor() as usize).max(1)
 }
 
 /// 아이콘 격자의 칸 하나 — 큰 아이콘 + 그 아래 이름(한 줄, 넘치면 말줄임).
@@ -1398,6 +1408,37 @@ mod tests {
             Some(FileAction::Navigate(base)),
             "브레드크럼 조상 세그먼트를 클릭했는데 Navigate 액션이 안 나옴"
         );
+    }
+
+    /// BUG-008: 칸 사이 간격까지 넣어도 마지막 칸이 폭 안에 들어가야 한다.
+    #[test]
+    fn icon_columns_accounts_for_spacing() {
+        // 84 칸 4개 + 간격 8 × 3 = 360 → 360 폭엔 4칸, 359 폭엔 3칸
+        assert_eq!(icon_columns(360.0, 84.0, 8.0), 4);
+        assert_eq!(icon_columns(359.0, 84.0, 8.0), 3);
+        // 간격을 빼먹던 예전 계산(359/84 = 4)이면 여기서 4가 나와 마지막 칸이 잘렸다
+        assert_eq!(icon_columns(10.0, 84.0, 8.0), 1, "아주 좁아도 최소 1칸");
+    }
+
+    /// BUG-008: 실제 아이콘 보기 그리기 경로로, 모든 아이콘 칸이 패널 폭 안에 그려지는지.
+    #[test]
+    fn icon_view_cells_stay_inside_panel_width() {
+        let names: Vec<String> = (0..20).map(|i| format!("f{i:02}.txt")).collect();
+        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let base = temp_dir_with("icon-grid-width", &refs);
+        let fs = settled_view(&base);
+        let ctx = egui::Context::default();
+        let mut state = FilePanelState::default();
+        state.view_mode = ViewMode::Icons;
+        ROW_RECTS.with(|m| m.borrow_mut().clear());
+        for _ in 0..2 {
+            frame(&ctx, &fs, &mut state);
+        }
+        let rects: Vec<egui::Rect> = ROW_RECTS.with(|m| m.borrow().values().copied().collect());
+        std::fs::remove_dir_all(&base).ok();
+        assert!(!rects.is_empty(), "아이콘이 하나도 안 그려짐");
+        let overflow: Vec<_> = rects.iter().filter(|r| r.right() > 400.0 + 0.5).collect();
+        assert!(overflow.is_empty(), "패널 폭(400) 밖으로 넘친 아이콘 칸: {overflow:?}");
     }
 
     /// DEV-022: 폴더 앞 화살표를 누르면 이동하지 않고 그 자리에서 하위 항목이
