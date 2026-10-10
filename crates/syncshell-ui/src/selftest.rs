@@ -56,6 +56,12 @@ pub struct SelfTest {
     focused: Arc<AtomicBool>,
     /// 키 보내는 스레드가 포커스를 잃어 중단했음
     focus_lost: Arc<AtomicBool>,
+    /// OS 키 보내기 쪽 기록(SendInput 결과·포그라운드 창 일치 여부)
+    os_trace: Arc<Mutex<OsTrace>>,
+    /// 앱이 실제로 받은 Q 키 이벤트 / "q" 텍스트 이벤트 수(입력 단계에서 셈) —
+    /// OS가 넣었는데 이게 0이면 winit/egui 단계에서 사라진 것이다.
+    raw_key_events: usize,
+    raw_text_events: usize,
     /// 측정이 무효인 이유(포커스 못 받음 등)
     invalid: Option<&'static str>,
     phase: Phase,
@@ -91,6 +97,9 @@ impl SelfTest {
             focused: Arc::new(AtomicBool::new(false)),
             focus_lost: Arc::new(AtomicBool::new(false)),
             invalid: None,
+            os_trace: Arc::new(Mutex::new(OsTrace::default())),
+            raw_key_events: 0,
+            raw_text_events: 0,
             phase: Phase::Warmup,
             phase_start: Instant::now(),
             last_frame: None,
@@ -115,6 +124,15 @@ impl SelfTest {
         if self.no_accesskit {
             // 활성화 요청(UIA 클라이언트 연결)이 오면 egui가 다시 켜므로 매 프레임 끈다.
             ctx.disable_accesskit();
+        }
+        if matches!(self.phase, Phase::Typing | Phase::Drain) && self.mode == Mode::OsKeys {
+            for e in &raw.events {
+                match e {
+                    egui::Event::Key { key: egui::Key::Q, pressed: true, .. } => self.raw_key_events += 1,
+                    egui::Event::Text(t) if t.contains(KEY) => self.raw_text_events += 1,
+                    _ => {}
+                }
+            }
         }
         if self.phase != Phase::Typing || self.mode != Mode::Internal {
             return;
@@ -175,7 +193,12 @@ impl SelfTest {
                     self.base_visible = visible;
                     self.phase = Phase::Typing;
                     self.phase_start = now;
-                    spawn_os_key_repeat(self.sent_log.clone(), self.focused.clone(), self.focus_lost.clone());
+                    spawn_os_key_repeat(
+                        self.sent_log.clone(),
+                        self.focused.clone(),
+                        self.focus_lost.clone(),
+                        self.os_trace.clone(),
+                    );
                 } else if self.phase_start.elapsed() >= FOCUS_WAIT_LIMIT {
                     self.invalid = Some("창이 포커스를 받지 못함(30초) — 키를 보내지 않았음");
                     self.phase = Phase::Done;
@@ -249,7 +272,7 @@ impl SelfTest {
              한 프레임에 몰아 넣은 입력 최대: {}\n\
              보낸 글자 {} · 화면에 보인 글자 {}\n\
              에코 지연: 중앙 {:.1}ms · p95 {:.1}ms · 최대 {:.1}ms\n\
-             입력 멈춘 뒤 따라잡기: {:.1}ms",
+             입력 멈춘 뒤 따라잡기: {:.1}ms{}",
             self.invalid.map(|r| format!("⚠ 측정 무효: {r}\n")).unwrap_or_default(),
             match self.mode {
                 Mode::Internal => "앱 내부 egui 이벤트(keys)",
@@ -275,6 +298,46 @@ impl SelfTest {
             pct(&mut self.echo, 0.95),
             pct(&mut self.echo, 1.0),
             self.drain_time.as_secs_f64() * 1000.0,
+            self.os_trace_report(),
+        )
+    }
+}
+
+/// OS 키 보내기 쪽 기록(BUG-006): 키가 어디서 사라지는지 단계별로 가른다.
+#[derive(Debug, Default, Clone)]
+struct OsTrace {
+    /// SendInput이 1을 돌려준(= OS 입력 큐에 들어간) 횟수
+    sendinput_ok: usize,
+    /// SendInput이 0을 돌려준 횟수와 마지막 GetLastError — UIPI 등으로 막힘
+    sendinput_fail: usize,
+    last_error: u32,
+    /// 보내는 순간 포그라운드 창이 우리 프로세스의 창이었던 횟수 / 아니었던 횟수
+    foreground_ours: usize,
+    foreground_other: usize,
+    /// Q의 하드웨어 스캔코드(MapVirtualKeyW)
+    scan_code: u32,
+}
+
+impl SelfTest {
+    fn os_trace_report(&self) -> String {
+        if self.mode != Mode::OsKeys {
+            return String::new();
+        }
+        let t = self.os_trace.lock().map(|t| t.clone()).unwrap_or_default();
+        format!(
+            "\n--- OS 키 경로 ---\n\
+             SendInput 성공 {} · 실패 {} (마지막 오류 {})\n\
+             보낼 때 포그라운드 창: 우리 창 {} · 다른 창 {}\n\
+             Q 스캔코드 {:#x}\n\
+             앱이 받은 이벤트: Q 키 {} · \"q\" 텍스트 {}",
+            t.sendinput_ok,
+            t.sendinput_fail,
+            t.last_error,
+            t.foreground_ours,
+            t.foreground_other,
+            t.scan_code,
+            self.raw_key_events,
+            self.raw_text_events,
         )
     }
 }
@@ -284,42 +347,97 @@ fn count_visible(session: &TerminalSession) -> usize {
 }
 
 /// OS 키 반복 흉내(Windows): 3초간 33ms마다 Q keydown을 SendInput으로 보내고 끝에
-/// keyup. 키를 꾹 누르고 있을 때처럼 keyup 없이 keydown만 이어진다.
+/// keyup. 키를 꾹 누르고 있을 때처럼 keyup 없이 keydown만 이어진다. 보낼 때마다
+/// SendInput 결과와 포그라운드 창이 우리 것인지 기록한다.
 #[cfg(windows)]
-fn spawn_os_key_repeat(log: Arc<Mutex<Vec<Instant>>>, focused: Arc<AtomicBool>, focus_lost: Arc<AtomicBool>) {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP};
-    fn key(up: bool) {
+fn spawn_os_key_repeat(
+    log: Arc<Mutex<Vec<Instant>>>,
+    focused: Arc<AtomicBool>,
+    focus_lost: Arc<AtomicBool>,
+    trace: Arc<Mutex<OsTrace>>,
+) {
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+
+    const VK_Q: u16 = 0x51;
+    // 실제 키보드처럼 스캔코드도 채운다 — 0이면 winit이 물리 키를 못 정해 버릴 수 있다.
+    // SAFETY: 단순 값 변환 API.
+    let scan = unsafe { MapVirtualKeyW(VK_Q as u32, MAPVK_VK_TO_VSC) };
+    if let Ok(mut t) = trace.lock() {
+        t.scan_code = scan;
+    }
+    let key = move |up: bool, trace: &Mutex<OsTrace>| {
         let input = INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
-                ki: KEYBDINPUT { wVk: 0x51 /* Q */, wScan: 0, dwFlags: if up { KEYEVENTF_KEYUP } else { 0 }, time: 0, dwExtraInfo: 0 },
+                ki: KEYBDINPUT {
+                    wVk: VK_Q,
+                    wScan: scan as u16,
+                    dwFlags: if up { KEYEVENTF_KEYUP } else { 0 },
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
             },
         };
-        // SAFETY: 스택의 INPUT 하나를 크기와 함께 넘긴다.
-        unsafe {
-            SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
+        // SAFETY: 스택의 INPUT 하나를 크기와 함께 넘긴다. GetLastError는 바로 이어서 읽는다.
+        let (n, err) = unsafe { (SendInput(1, &input, std::mem::size_of::<INPUT>() as i32), GetLastError()) };
+        if !up {
+            if let Ok(mut t) = trace.lock() {
+                if n == 1 {
+                    t.sendinput_ok += 1;
+                } else {
+                    t.sendinput_fail += 1;
+                    t.last_error = err;
+                }
+            }
         }
-    }
+    };
+    let foreground_is_ours = || {
+        // SAFETY: 핸들/PID를 읽기만 한다.
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            pid == std::process::id()
+        }
+    };
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(100)); // 포커스가 확인된 직후라 짧게만 둔다
         let start = Instant::now();
         let mut next = start;
         while start.elapsed() < TYPING {
             // 포커스를 잃었으면 즉시 멈춘다 — 안 그러면 q가 다른 창에 들어간다.
-            if !focused.load(Ordering::Relaxed) {
+            let ours = foreground_is_ours();
+            if let Ok(mut t) = trace.lock() {
+                if ours {
+                    t.foreground_ours += 1;
+                } else {
+                    t.foreground_other += 1;
+                }
+            }
+            if !focused.load(Ordering::Relaxed) || !ours {
                 focus_lost.store(true, Ordering::Relaxed);
                 break;
             }
             if let Ok(mut v) = log.lock() {
                 v.push(Instant::now());
             }
-            key(false);
+            key(false, &trace);
             next += REPEAT;
             std::thread::sleep(next.saturating_duration_since(Instant::now()));
         }
-        key(true);
+        key(true, &trace);
     });
 }
 
 #[cfg(not(windows))]
-fn spawn_os_key_repeat(_log: Arc<Mutex<Vec<Instant>>>, _focused: Arc<AtomicBool>, _focus_lost: Arc<AtomicBool>) {}
+fn spawn_os_key_repeat(
+    _log: Arc<Mutex<Vec<Instant>>>,
+    _focused: Arc<AtomicBool>,
+    _focus_lost: Arc<AtomicBool>,
+    _trace: Arc<Mutex<OsTrace>>,
+) {
+}
