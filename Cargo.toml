@@ -1,10 +1,16 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/egui-winit"]
 members = [
     "crates/syncshell-core",
     "crates/syncshell-ui",
     "crates/syncshell",
 ]
+
+# egui-winit에 한 줄 패치를 얹어 쓴다(BUG-006, vendor/egui-winit/README-syncshell.md).
+# eframe/egui 버전을 올릴 때 이 패치가 아직 필요한지 다시 확인할 것.
+[patch.crates-io]
+egui-winit = { path = "vendor/egui-winit" }
 
 [workspace.package]
 version = "0.1.0"
