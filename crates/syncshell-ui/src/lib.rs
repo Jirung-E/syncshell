@@ -352,6 +352,10 @@ pub struct SyncShellApp {
     profiler: Option<profile::Profiler>,
     /// `SYNCSHELL_SELFTEST=keys`일 때만 켜지는 실제 창 자가 진단(BUG-006).
     selftest: Option<selftest::SelfTest>,
+    /// `SYNCSHELL_NO_IME=1`이면 IME를 끈다(BUG-006 진단). Windows에서 IME 허용
+    /// 상태일 때만 키 반복이 밀리는지 실제 키보드로 비교하려고 넣었다 — 끄면 한글
+    /// 입력은 안 된다.
+    no_ime: bool,
 }
 
 /// [`Tab::sync_status`] 참고.
@@ -459,6 +463,7 @@ impl SyncShellApp {
             view_mode: ViewMode::parse(&state.ui.view),
             profiler: profile::Profiler::from_env(),
             selftest: selftest::SelfTest::from_env(),
+            no_ime: std::env::var("SYNCSHELL_NO_IME").is_ok_and(|v| !v.is_empty() && v != "0"),
         }
     }
 
@@ -968,6 +973,12 @@ impl eframe::App for SyncShellApp {
             self.last_window_rect = Some(rect);
         }
 
+        if self.no_ime {
+            // 터미널 위젯이 매 프레임 IME를 켜달라고 내보내는 걸 지운다 — egui-winit이
+            // 그걸 보고 set_ime_allowed(false)를 부른다.
+            ui.ctx().output_mut(|o| o.ime = None);
+        }
+
         if let Some(t) = &mut self.selftest {
             if let Some(report) = t.frame(ui.ctx(), frame, self.tabs[self.active].terminal.as_mut()) {
                 eprintln!("{report}");
@@ -1095,6 +1106,7 @@ mod tests {
             view_mode: ViewMode::Tree,
             profiler: None,
             selftest: None,
+            no_ime: false,
         };
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, TAB_BAR_HEIGHT));
         let mut frame = |events: Vec<egui::Event>| {
@@ -1200,6 +1212,7 @@ mod tests {
             view_mode: ViewMode::Tree,
             profiler: None,
             selftest: None,
+            no_ime: false,
         };
         theme::apply(&ctx, ThemeMode::Dark);
         assert_eq!(ctx.global_style().visuals.panel_fill, theme::DARK.panel);
@@ -1232,6 +1245,7 @@ mod tests {
             view_mode: ViewMode::Tree,
             profiler: None,
             selftest: None,
+            no_ime: false,
         };
         assert_eq!(app.tabs.len(), 1);
 
@@ -1290,6 +1304,7 @@ mod tests {
             view_mode: ViewMode::Tree,
             profiler: None,
             selftest: None,
+            no_ime: false,
         };
 
         app.on_exit();

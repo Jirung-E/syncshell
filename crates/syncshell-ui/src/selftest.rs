@@ -7,8 +7,8 @@
 //!   33ms마다 keydown을 보낸다 — OS → IME → winit → AccessKit → egui 경로까지 잰다.
 //!   다른 OS에선 `keys`로 대신한다.
 //!
-//! `SYNCSHELL_NO_IME=1`을 같이 주면 측정 중 IME를 끈다(터미널의 IME 출력을 지움) —
-//! Windows에서 한국어 IME가 키를 조합 경로로 가져가는지 가른다.
+//! `SYNCSHELL_NO_IME=1`(앱 전체 옵션, lib.rs)을 같이 주면 IME를 끈 채로 잰다 —
+//! 보고서에 그 여부를 찍는다.
 //!
 //! `SYNCSHELL_NO_ACCESSKIT=1`을 같이 주면 AccessKit(접근성 트리)을 매 프레임 끈다 —
 //! 켜짐/꺼짐을 비교해 AccessKit 비용인지 가른다.
@@ -184,11 +184,6 @@ impl SelfTest {
         let interval = self.last_frame.map(|t| now - t);
         self.last_frame = Some(now);
         ctx.request_repaint_after(Duration::from_millis(5));
-        if self.no_ime {
-            // 터미널 위젯이 매 프레임 IME를 켜달라고 내보내는 걸 지운다 — egui-winit이
-            // 그걸 보고 set_ime_allowed(false)를 부른다.
-            ctx.output_mut(|o| o.ime = None);
-        }
 
         if ctx.accesskit_node_builder(egui::Id::NULL, |_| ()).is_some() {
             self.accesskit_active = true;
