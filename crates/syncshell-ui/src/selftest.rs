@@ -7,6 +7,9 @@
 //!   33ms마다 keydown을 보낸다 — OS → IME → winit → AccessKit → egui 경로까지 잰다.
 //!   다른 OS에선 `keys`로 대신한다.
 //!
+//! `SYNCSHELL_NO_IME=1`을 같이 주면 측정 중 IME를 끈다(터미널의 IME 출력을 지움) —
+//! Windows에서 한국어 IME가 키를 조합 경로로 가져가는지 가른다.
+//!
 //! `SYNCSHELL_NO_ACCESSKIT=1`을 같이 주면 AccessKit(접근성 트리)을 매 프레임 끈다 —
 //! 켜짐/꺼짐을 비교해 AccessKit 비용인지 가른다.
 //!
@@ -62,6 +65,9 @@ pub struct SelfTest {
     /// OS가 넣었는데 이게 0이면 winit/egui 단계에서 사라진 것이다.
     raw_key_events: usize,
     raw_text_events: usize,
+    /// 측정 중 앱이 받은 입력 이벤트 전부를 종류·내용별로 센 것(IME 조합 이벤트 포함)
+    raw_histogram: std::collections::BTreeMap<String, usize>,
+    no_ime: bool,
     /// 측정이 무효인 이유(포커스 못 받음 등)
     invalid: Option<&'static str>,
     phase: Phase,
@@ -100,6 +106,8 @@ impl SelfTest {
             os_trace: Arc::new(Mutex::new(OsTrace::default())),
             raw_key_events: 0,
             raw_text_events: 0,
+            raw_histogram: std::collections::BTreeMap::new(),
+            no_ime: std::env::var("SYNCSHELL_NO_IME").is_ok_and(|v| !v.is_empty() && v != "0"),
             phase: Phase::Warmup,
             phase_start: Instant::now(),
             last_frame: None,
@@ -132,6 +140,22 @@ impl SelfTest {
                     egui::Event::Text(t) if t.contains(KEY) => self.raw_text_events += 1,
                     _ => {}
                 }
+                let label = match e {
+                    egui::Event::Key { key, pressed, repeat, .. } => {
+                        Some(format!("Key({key:?}, {}{})", if *pressed { "down" } else { "up" }, if *repeat { ", repeat" } else { "" }))
+                    }
+                    egui::Event::Text(t) => Some(format!("Text({t:?})")),
+                    egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) => Some(format!("Ime(Preedit {text:?})")),
+                    egui::Event::Ime(egui::ImeEvent::Commit(t)) => Some(format!("Ime(Commit {t:?})")),
+                    egui::Event::Ime(other) => Some(format!("Ime({other:?})")),
+                    _ => None,
+                };
+                if let Some(label) = label {
+                    // 서로 다른 내용이 끝없이 늘어나지 않게 상한을 둔다.
+                    if self.raw_histogram.len() < 40 || self.raw_histogram.contains_key(&label) {
+                        *self.raw_histogram.entry(label).or_default() += 1;
+                    }
+                }
             }
         }
         if self.phase != Phase::Typing || self.mode != Mode::Internal {
@@ -160,6 +184,11 @@ impl SelfTest {
         let interval = self.last_frame.map(|t| now - t);
         self.last_frame = Some(now);
         ctx.request_repaint_after(Duration::from_millis(5));
+        if self.no_ime {
+            // 터미널 위젯이 매 프레임 IME를 켜달라고 내보내는 걸 지운다 — egui-winit이
+            // 그걸 보고 set_ime_allowed(false)를 부른다.
+            ctx.output_mut(|o| o.ime = None);
+        }
 
         if ctx.accesskit_node_builder(egui::Id::NULL, |_| ()).is_some() {
             self.accesskit_active = true;
@@ -316,6 +345,8 @@ struct OsTrace {
     foreground_other: usize,
     /// Q의 하드웨어 스캔코드(MapVirtualKeyW)
     scan_code: u32,
+    /// 첫 키를 보낼 때 포그라운드 창의 IME 상태(열림 여부, 한글/영문 변환 모드)
+    ime_state: String,
 }
 
 impl SelfTest {
@@ -329,15 +360,25 @@ impl SelfTest {
              SendInput 성공 {} · 실패 {} (마지막 오류 {})\n\
              보낼 때 포그라운드 창: 우리 창 {} · 다른 창 {}\n\
              Q 스캔코드 {:#x}\n\
-             앱이 받은 이벤트: Q 키 {} · \"q\" 텍스트 {}",
+             보낼 때 IME: {}\n\
+             IME 출력(터미널이 IME 켜달라고 함): {}\n\
+             앱이 받은 이벤트: Q 키 {} · \"q\" 텍스트 {}\n\
+             받은 입력 이벤트 전체(종류별):\n{}",
             t.sendinput_ok,
             t.sendinput_fail,
             t.last_error,
             t.foreground_ours,
             t.foreground_other,
             t.scan_code,
+            if t.ime_state.is_empty() { "(확인 못 함)" } else { t.ime_state.as_str() },
+            if self.no_ime { "강제로 끔(SYNCSHELL_NO_IME)" } else { "켬(기본)" },
             self.raw_key_events,
             self.raw_text_events,
+            if self.raw_histogram.is_empty() {
+                "  (없음)".to_string()
+            } else {
+                self.raw_histogram.iter().map(|(k, v)| format!("  {k} × {v}")).collect::<Vec<_>>().join("\n")
+            },
         )
     }
 }
@@ -360,7 +401,8 @@ fn spawn_os_key_repeat(
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC,
     };
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    use windows_sys::Win32::UI::Input::Ime::{ImmGetDefaultIMEWnd, IME_CMODE_NATIVE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, SendMessageW, WM_IME_CONTROL};
 
     const VK_Q: u16 = 0x51;
     // 실제 키보드처럼 스캔코드도 채운다 — 0이면 winit이 물리 키를 못 정해 버릴 수 있다.
@@ -404,8 +446,30 @@ fn spawn_os_key_repeat(
             pid == std::process::id()
         }
     };
+    // 포그라운드 창의 IME 상태 — 기본 IME 창에 WM_IME_CONTROL을 보내 묻는다(다른
+    // 스레드에서도 동작하는 방법). IMC_GETOPENSTATUS=5, IMC_GETCONVERSIONMODE=1.
+    let ime_state = || -> String {
+        // SAFETY: 핸들을 읽고 메시지로 상태를 묻기만 한다.
+        unsafe {
+            let ime_wnd = ImmGetDefaultIMEWnd(GetForegroundWindow());
+            if ime_wnd.is_null() {
+                return "IME 창 없음(IME 미사용)".to_string();
+            }
+            let open = SendMessageW(ime_wnd, WM_IME_CONTROL, 5, 0) != 0;
+            let mode = SendMessageW(ime_wnd, WM_IME_CONTROL, 1, 0) as u32;
+            let native = mode & IME_CMODE_NATIVE != 0;
+            format!(
+                "{} · 변환 모드 {mode:#x} ({})",
+                if open { "열림" } else { "닫힘" },
+                if native { "한글(네이티브)" } else { "영문" }
+            )
+        }
+    };
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(100)); // 포커스가 확인된 직후라 짧게만 둔다
+        if let Ok(mut t) = trace.lock() {
+            t.ime_state = ime_state();
+        }
         let start = Instant::now();
         let mut next = start;
         while start.elapsed() < TYPING {

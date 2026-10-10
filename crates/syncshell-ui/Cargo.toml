@@ -22,4 +22,4 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # BUG-006 진단: 자가 진단(`SYNCSHELL_SELFTEST=oskeys`)이 실제 OS 키 입력(SendInput)으로
 # 키 반복을 흉내 내서, OS → IME → winit → egui 경로까지 재기 위해.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_UI_Input_Ime", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
