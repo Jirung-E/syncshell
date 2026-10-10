@@ -1151,7 +1151,15 @@ impl State {
             // IME에서는 키 하나마다 이 처리가 끼어 키 반복이 OS 속도(≈30회/초)를 못 따라가
             // (실측 ≈21회/초) 키를 뗀 뒤에도 밀린 입력이 계속 들어갔다. 영역이 실제로
             // 바뀔 때만 알린다.
-            if self.ime_rect_px != Some(ime_rect_px) {
+            // 비교용 스위치(BUG-007 확인 중): SYNCSHELL_IME_AREA_EVERY_EVENT=1이면 원본
+            // 동작(입력 이벤트가 있는 프레임마다 다시 알림)으로 돌아간다. 이 패치가
+            // 여전히 필요한지 가린 뒤 지운다.
+            static EVERY_EVENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let every_event =
+                *EVERY_EVENT.get_or_init(|| std::env::var_os("SYNCSHELL_IME_AREA_EVERY_EVENT").is_some());
+            if self.ime_rect_px != Some(ime_rect_px)
+                || (every_event && self.egui_ctx.input(|i| !i.events.is_empty()))
+            {
                 self.ime_rect_px = Some(ime_rect_px);
                 profiling::scope!("set_ime_cursor_area");
                 window.set_ime_cursor_area(

@@ -522,7 +522,13 @@ fn pos_to_cell(pos: Pos2, rect: Rect, cell: Vec2, session: &TerminalSession) -> 
 }
 
 fn claim_terminal_focus(ui: &mut egui::Ui, response: &egui::Response) {
-    response.request_focus();
+    // 이미 포커스를 가졌으면 다시 요청하지 않는다(BUG-007). egui의 request_focus는
+    // 부를 때마다 IME 조합 중단(interrupt_ime)도 같이 요청해서, 매 프레임 부르면
+    // egui-winit이 매 프레임 IME를 껐다 켜 한글 조합이 확정되기 전에 계속 취소됐다.
+    // 키를 가로채지 않게 하는 포커스 잠금 필터는 매 프레임 그대로 건다.
+    if !response.has_focus() {
+        response.request_focus();
+    }
     ui.memory_mut(|m| {
         m.set_focus_lock_filter(
             response.id,
@@ -539,6 +545,31 @@ fn claim_terminal_focus(ui: &mut egui::Ui, response: &egui::Response) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BUG-007: 터미널이 이미 포커스를 가진 뒤에는 IME 조합 중단을 요청하지 않아야
+    /// 한다 — 매 프레임 요청하면 egui-winit이 IME를 껐다 켜 한글 조합이 계속 취소된다.
+    /// 처음 포커스를 가져오는 프레임만 중단 요청이 있을 수 있다.
+    #[test]
+    fn ime_composition_is_not_interrupted_every_frame() {
+        let ctx = egui::Context::default();
+        let mut widget = TerminalWidget::new();
+        let mut session =
+            TerminalSession::spawn(&syncshell_core::terminal::default_shell(), 80, 24, || {}).expect("셸 스폰");
+        let mut interrupts = Vec::new();
+        for _ in 0..6 {
+            session.pump();
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 500.0)));
+            let out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| widget.show(ui, &mut session));
+            });
+            interrupts.push(out.platform_output.ime.map(|i| i.should_interrupt_composition));
+        }
+        assert!(
+            interrupts[2..].iter().all(|x| *x == Some(false)),
+            "포커스를 이미 가진 뒤에도 매 프레임 IME 조합 중단을 요청함: {interrupts:?}"
+        );
+    }
 
     fn key_event(key: egui::Key) -> egui::Event {
         egui::Event::Key {
