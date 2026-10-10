@@ -18,3 +18,8 @@ ttf-parser = "0.25"
 # 탐색기의 수정일 컬럼 표시용(DEV-005). 이미 다른 의존성(wgpu 등)이 끌어오는
 # 버전이라 새 크레이트 컴파일 비용이 사실상 없음 — 버전만 고정해 직접 의존.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# BUG-006 진단: 자가 진단(`SYNCSHELL_SELFTEST=oskeys`)이 실제 OS 키 입력(SendInput)으로
+# 키 반복을 흉내 내서, OS → IME → winit → egui 경로까지 재기 위해.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_UI_Input_KeyboardAndMouse"] }

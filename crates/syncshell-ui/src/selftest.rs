@@ -2,11 +2,20 @@
 //! 창을 띄운 채 스스로 키 반복 입력을 흉내 내고(33ms마다 'q'), 프레임 간격·
 //! CPU 시간·에코 지연·밀린 입력을 재서 stderr에 보고한 뒤 스스로 종료한다.
 //!
+//! - `keys`: 앱 내부에서 egui 이벤트로 바로 넣는다(창·렌더러 경로만 잼).
+//! - `oskeys`(Windows 전용): 실제 OS 키 입력(SendInput)으로 Q를 누르고 있는 것처럼
+//!   33ms마다 keydown을 보낸다 — OS → IME → winit → AccessKit → egui 경로까지 잰다.
+//!   다른 OS에선 `keys`로 대신한다.
+//!
+//! `SYNCSHELL_NO_ACCESSKIT=1`을 같이 주면 AccessKit(접근성 트리)을 매 프레임 끈다 —
+//! 켜짐/꺼짐을 비교해 AccessKit 비용인지 가른다.
+//!
 //! 헤드리스 진단(`latency_probe.rs`)은 창·렌더러를 거치지 않아서, Windows에서
 //! "실제 창에서만 느림"을 가르려고 넣었다. 프레임 간격이 키 반복 간격(33ms)보다
 //! 길면, 실제 키를 누를 때 OS 메시지 큐에 키 반복이 쌓여 "떼도 계속 입력됨"이 된다.
 
 use eframe::egui;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use syncshell_core::terminal::TerminalSession;
 
@@ -24,11 +33,22 @@ enum Phase {
     Done,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// egui 이벤트를 앱 안에서 바로 넣음
+    Internal,
+    /// OS 키 입력(SendInput)
+    OsKeys,
+}
+
 pub struct SelfTest {
+    mode: Mode,
+    no_accesskit: bool,
+    /// 키를 "보낸" 시각들 — OS 키 모드에선 별도 스레드가 채운다.
+    sent_log: Arc<Mutex<Vec<Instant>>>,
     phase: Phase,
     phase_start: Instant,
     last_frame: Option<Instant>,
-    sent: Vec<Instant>,
     seen: usize,
     base_visible: usize,
     intervals: Vec<Duration>,
@@ -42,44 +62,62 @@ pub struct SelfTest {
 
 impl SelfTest {
     pub fn from_env() -> Option<Self> {
-        match std::env::var("SYNCSHELL_SELFTEST") {
-            Ok(v) if v == "keys" => Some(Self {
-                phase: Phase::Warmup,
-                phase_start: Instant::now(),
-                last_frame: None,
-                sent: Vec::new(),
-                seen: 0,
-                base_visible: 0,
-                intervals: Vec::new(),
-                cpu: Vec::new(),
-                max_injected_per_frame: 0,
-                echo: Vec::new(),
-                drain_time: Duration::ZERO,
-                accesskit_active: false,
-                adapter: "(알 수 없음)".to_string(),
-            }),
-            _ => None,
-        }
+        let mode = match std::env::var("SYNCSHELL_SELFTEST").as_deref() {
+            Ok("keys") => Mode::Internal,
+            Ok("oskeys") if cfg!(windows) => Mode::OsKeys,
+            Ok("oskeys") => {
+                eprintln!("[selftest] oskeys는 Windows 전용 — keys로 대신함");
+                Mode::Internal
+            }
+            _ => return None,
+        };
+        let no_accesskit = std::env::var("SYNCSHELL_NO_ACCESSKIT").is_ok_and(|v| !v.is_empty() && v != "0");
+        Some(Self {
+            mode,
+            no_accesskit,
+            sent_log: Arc::new(Mutex::new(Vec::new())),
+            phase: Phase::Warmup,
+            phase_start: Instant::now(),
+            last_frame: None,
+            seen: 0,
+            base_visible: 0,
+            intervals: Vec::new(),
+            cpu: Vec::new(),
+            max_injected_per_frame: 0,
+            echo: Vec::new(),
+            drain_time: Duration::ZERO,
+            accesskit_active: false,
+            adapter: "(알 수 없음)".to_string(),
+        })
+    }
+
+    fn sent_snapshot(&self) -> Vec<Instant> {
+        self.sent_log.lock().map(|v| v.clone()).unwrap_or_default()
     }
 
     /// `raw_input_hook`에서 부른다 — 입력 중이면 그새 밀린 만큼 키 반복 이벤트를 넣는다.
-    pub fn inject(&mut self, raw: &mut egui::RawInput) {
-        if self.phase != Phase::Typing {
+    pub fn inject(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        if self.no_accesskit {
+            // 활성화 요청(UIA 클라이언트 연결)이 오면 egui가 다시 켜므로 매 프레임 끈다.
+            ctx.disable_accesskit();
+        }
+        if self.phase != Phase::Typing || self.mode != Mode::Internal {
             return;
         }
         let due = (self.phase_start.elapsed().as_millis() / REPEAT.as_millis()) as usize + 1;
-        let n = due.saturating_sub(self.sent.len());
+        let mut sent = self.sent_log.lock().unwrap();
+        let n = due.saturating_sub(sent.len());
         self.max_injected_per_frame = self.max_injected_per_frame.max(n);
         for _ in 0..n {
             raw.events.push(egui::Event::Key {
                 key: egui::Key::Q,
                 physical_key: Some(egui::Key::Q),
                 pressed: true,
-                repeat: !self.sent.is_empty(),
+                repeat: !sent.is_empty(),
                 modifiers: egui::Modifiers::NONE,
             });
             raw.events.push(egui::Event::Text(KEY.to_string()));
-            self.sent.push(Instant::now());
+            sent.push(Instant::now());
         }
     }
 
@@ -105,6 +143,11 @@ impl SelfTest {
                     self.base_visible = visible;
                     self.phase = Phase::Typing;
                     self.phase_start = now;
+                    if self.mode == Mode::OsKeys {
+                        // SendInput은 포커스를 가진 창으로 간다.
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        spawn_os_key_repeat(self.sent_log.clone());
+                    }
                 }
             }
             Phase::Typing | Phase::Drain => {
@@ -114,16 +157,17 @@ impl SelfTest {
                 if let Some(c) = frame.info().cpu_usage {
                     self.cpu.push(c);
                 }
-                let shown = visible.saturating_sub(self.base_visible).min(self.sent.len());
+                let sent = self.sent_snapshot();
+                let shown = visible.saturating_sub(self.base_visible).min(sent.len());
                 while self.seen < shown {
-                    self.echo.push(self.sent[self.seen].elapsed());
+                    self.echo.push(sent[self.seen].elapsed());
                     self.seen += 1;
                 }
                 if self.phase == Phase::Typing && self.phase_start.elapsed() >= TYPING {
                     self.phase = Phase::Drain;
                     self.phase_start = now;
                 } else if self.phase == Phase::Drain
-                    && (self.seen >= self.sent.len() || self.phase_start.elapsed() >= DRAIN_LIMIT)
+                    && (self.seen >= sent.len() || self.phase_start.elapsed() >= DRAIN_LIMIT)
                 {
                     self.drain_time = self.phase_start.elapsed();
                     self.phase = Phase::Done;
@@ -150,6 +194,7 @@ impl SelfTest {
         let slow = self.intervals.iter().filter(|d| **d > REPEAT).count();
         format!(
             "=== 실제 창 자가 진단 ===\n\
+             입력 방식: {}\n\
              GPU: {}\n\
              AccessKit(접근성 트리): {}\n\
              프레임 간격: 중앙 {:.1}ms · p95 {:.1}ms · 최대 {:.1}ms · 33ms 넘은 프레임 {}/{}\n\
@@ -158,8 +203,16 @@ impl SelfTest {
              보낸 글자 {} · 화면에 보인 글자 {}\n\
              에코 지연: 중앙 {:.1}ms · p95 {:.1}ms · 최대 {:.1}ms\n\
              입력 멈춘 뒤 따라잡기: {:.1}ms",
+            match self.mode {
+                Mode::Internal => "앱 내부 egui 이벤트(keys)",
+                Mode::OsKeys => "OS 키 입력 SendInput(oskeys)",
+            },
             self.adapter,
-            if self.accesskit_active { "켜짐" } else { "꺼짐" },
+            match (self.no_accesskit, self.accesskit_active) {
+                (true, _) => "강제로 끔(SYNCSHELL_NO_ACCESSKIT)",
+                (false, true) => "켜짐",
+                (false, false) => "꺼짐",
+            },
             pct(&mut self.intervals, 0.5),
             pct(&mut self.intervals, 0.95),
             pct(&mut self.intervals, 1.0),
@@ -168,7 +221,7 @@ impl SelfTest {
             cpu_mid,
             cpu_max,
             self.max_injected_per_frame,
-            self.sent.len(),
+            self.sent_snapshot().len(),
             self.seen,
             pct(&mut self.echo, 0.5),
             pct(&mut self.echo, 0.95),
@@ -181,3 +234,39 @@ impl SelfTest {
 fn count_visible(session: &TerminalSession) -> usize {
     session.term.renderable_content().display_iter.filter(|c| c.cell.c == KEY).count()
 }
+
+/// OS 키 반복 흉내(Windows): 3초간 33ms마다 Q keydown을 SendInput으로 보내고 끝에
+/// keyup. 키를 꾹 누르고 있을 때처럼 keyup 없이 keydown만 이어진다.
+#[cfg(windows)]
+fn spawn_os_key_repeat(log: Arc<Mutex<Vec<Instant>>>) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP};
+    fn key(up: bool) {
+        let input = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT { wVk: 0x51 /* Q */, wScan: 0, dwFlags: if up { KEYEVENTF_KEYUP } else { 0 }, time: 0, dwExtraInfo: 0 },
+            },
+        };
+        // SAFETY: 스택의 INPUT 하나를 크기와 함께 넘긴다.
+        unsafe {
+            SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
+        }
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300)); // 포커스 이동 대기
+        let start = Instant::now();
+        let mut next = start;
+        while start.elapsed() < TYPING {
+            if let Ok(mut v) = log.lock() {
+                v.push(Instant::now());
+            }
+            key(false);
+            next += REPEAT;
+            std::thread::sleep(next.saturating_duration_since(Instant::now()));
+        }
+        key(true);
+    });
+}
+
+#[cfg(not(windows))]
+fn spawn_os_key_repeat(_log: Arc<Mutex<Vec<Instant>>>) {}

@@ -855,9 +855,9 @@ const STATUS_BAR_HEIGHT: f32 = 24.0;
 const TERMINAL_PADDING: egui::Margin = egui::Margin { left: 12, right: 8, top: 8, bottom: 6 };
 
 impl eframe::App for SyncShellApp {
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         if let Some(t) = &mut self.selftest {
-            t.inject(raw_input);
+            t.inject(ctx, raw_input);
         }
     }
 
