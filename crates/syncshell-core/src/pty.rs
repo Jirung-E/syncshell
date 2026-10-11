@@ -9,7 +9,14 @@ pub struct Pty {
 }
 
 impl Pty {
-    pub fn spawn(shell: &str, args: &[&str], cols: u16, rows: u16) -> Result<(Self, Box<dyn Read + Send>)> {
+    /// `env`: 자식에게 줄 환경변수 조정 — `Some`이면 설정, `None`이면 지운다.
+    pub fn spawn(
+        shell: &str,
+        args: &[&str],
+        env: &[(&str, Option<std::ffi::OsString>)],
+        cols: u16,
+        rows: u16,
+    ) -> Result<(Self, Box<dyn Read + Send>)> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows,
@@ -21,6 +28,12 @@ impl Pty {
         let mut cmd = CommandBuilder::new(shell);
         for a in args {
             cmd.arg(a);
+        }
+        for (key, value) in env {
+            match value {
+                Some(v) => cmd.env(key, v),
+                None => cmd.env_remove(key),
+            }
         }
         let child = pair.slave.spawn_command(cmd)?;
         // slave 핸들은 자식 프로세스에 넘긴 뒤 여기서는 곧바로 drop —

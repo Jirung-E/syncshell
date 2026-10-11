@@ -4,6 +4,7 @@ pub mod interrupt;
 pub mod osc7;
 pub mod pty;
 pub mod session;
+pub mod shell_integration;
 pub mod sync;
 pub mod terminal;
 

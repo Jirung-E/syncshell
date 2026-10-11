@@ -181,14 +181,15 @@ pub fn start_dir() -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// `SYNCSHELL_HOME`은 프로세스 전역 상태라, cargo test의 기본 스레드 병렬
     /// 실행에서 이 모듈의 테스트끼리 서로 값을 덮어쓸 수 있다 — 뮤텍스로 이
     /// 모듈의 테스트를 순차 실행되게 강제한다(다른 모듈 테스트와는 무관해
-    /// 전체 스위트 속도에 영향 없음).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// 전체 스위트 속도에 영향 없음). zsh를 실제로 띄우는 테스트도 잡는다 —
+    /// 띄울 때 통합 파일을 `SYNCSHELL_HOME` 아래에 쓰기 때문(BUG-003).
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn with_syncshell_home<T>(f: impl FnOnce(&Path) -> T) -> T {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

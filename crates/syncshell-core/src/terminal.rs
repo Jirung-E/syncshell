@@ -144,13 +144,30 @@ impl TerminalSession {
         // 초기화 스크립트(아래)가 겹쳐 보여서 첫 실행 화면이 뭔가 잘못된 것처럼
         // (예: "엔터가 이미 쳐진 것 같다") 보였던 것의 원인 중 하나였다(TR-006 피드백).
         let args: &[&str] = if is_powershell { &["-NoLogo"] } else { &[] };
-        let (mut pty, mut reader) = Pty::spawn(shell, args, cols, rows)?;
+
+        // BUG-003: zsh는 OSC 7 훅을 타이핑해 넣으면 긴 함수 정의가 화면에 에코된다 —
+        // ZDOTDIR을 우리 통합 폴더로 바꿔 띄워, 사용자 시작 파일을 읽은 뒤 훅을
+        // 등록하게 한다(shell_integration.rs). 파일을 못 쓰면 예전처럼 타이핑으로.
+        let zsh_zdotdir = if is_zsh { crate::shell_integration::prepare_zsh().ok() } else { None };
+        let mut env: Vec<(&str, Option<std::ffi::OsString>)> = Vec::new();
+        if let Some(dir) = &zsh_zdotdir {
+            env.push((crate::shell_integration::USER_ZDOTDIR_VAR, std::env::var_os("ZDOTDIR")));
+            env.push(("ZDOTDIR", Some(dir.clone().into_os_string())));
+        }
+        if !cfg!(windows) {
+            // macOS 터미널 앱에서 실행하면 이 값들을 물려받아, /etc/zshrc가 그 앱 전용
+            // 세션 복원(`Restored session: …`, 폴더 이동)을 돌린다 — 우리 앱 것이 아니다.
+            env.push(("TERM_PROGRAM", Some("syncshell".into())));
+            env.push(("TERM_PROGRAM_VERSION", Some(crate::version().into())));
+            env.push(("TERM_SESSION_ID", None));
+        }
+        let (mut pty, mut reader) = Pty::spawn(shell, args, &env, cols, rows)?;
 
         // DEV-004 결론: $PROFILE은 건드리지 않고, PTY 기동 직후 지연 없이
         // "타이핑하듯" 스크립트를 써넣는다. PowerShell/zsh 외 셸은 예광탄 범위 밖(생략).
         let injection_script = if is_powershell {
             Some(powershell_injection_script())
-        } else if is_zsh {
+        } else if is_zsh && zsh_zdotdir.is_none() {
             Some(zsh_injection_script())
         } else {
             None
@@ -447,6 +464,7 @@ mod tests {
     #[test]
     #[cfg_attr(windows, ignore = "이 테스트는 zsh 전용 — Windows에는 없음")]
     fn zsh_session_tracks_input_and_command_state_transitions() {
+        let _env = crate::session::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut session = TerminalSession::spawn("/bin/zsh", 80, 24, || {}).expect("zsh spawn");
         pump_for(&mut session, 700);
 
@@ -469,6 +487,21 @@ mod tests {
         // 다시 내려가야 한다.
         pump_for(&mut session, 1200);
         assert!(!session.is_command_running(), "명령이 끝났는데 command_running이 안 내려감");
+    }
+
+    /// BUG-003: zsh 시작 화면에 OSC 7 훅 정의가 에코되지 않고, macOS 터미널 앱의
+    /// 세션 복원 메시지도 없어야 한다. 훅은 그대로 동작해 cwd가 보고돼야 한다.
+    #[test]
+    #[cfg_attr(windows, ignore = "이 테스트는 zsh 전용 — Windows에는 없음")]
+    fn zsh_startup_does_not_echo_hook_and_reports_cwd() {
+        let _env = crate::session::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut session = TerminalSession::spawn("/bin/zsh", 80, 24, || {}).expect("zsh spawn");
+        pump_for(&mut session, 1000);
+
+        let screen: String = session.term.renderable_content().display_iter.map(|c| c.cell.c).collect();
+        assert!(!screen.contains("_syncshell_osc7"), "훅 정의가 화면에 보임: {}", screen.trim());
+        assert!(!screen.contains("Restored session"), "macOS 터미널 앱 세션 복원이 돌았음");
+        assert!(session.take_cwd_change().is_some(), "OSC 7로 cwd가 보고되지 않음");
     }
 
     /// `supports_line_prefix_insert`는 지금은 zsh만 true다(필드 설명 참고 —
