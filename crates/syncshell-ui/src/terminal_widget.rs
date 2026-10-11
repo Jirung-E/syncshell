@@ -119,6 +119,7 @@ impl TerminalWidget {
         response: &egui::Response,
         session: &mut TerminalSession,
         rect: Rect,
+        grid_rect: Rect,
         cell: Vec2,
     ) {
         use alacritty_terminal::selection::{Selection, SelectionType};
@@ -126,7 +127,7 @@ impl TerminalWidget {
         let Some(pos) = response.interact_pointer_pos() else {
             return;
         };
-        let (point, side) = pos_to_cell(pos, rect, cell, session);
+        let (point, side) = pos_to_cell(pos, grid_rect, cell, session);
 
         // 더블클릭=단어, 트리플클릭=줄. egui는 트리플클릭도 double_clicked()를
         // true로 보고하므로 트리플을 먼저 본다 — 순서를 바꾸면 줄 선택이 안 된다.
@@ -142,7 +143,7 @@ impl TerminalWidget {
             let origin = ui
                 .input(|i| i.pointer.press_origin())
                 .unwrap_or(pos);
-            let (start, start_side) = pos_to_cell(origin, rect, cell, session);
+            let (start, start_side) = pos_to_cell(origin, grid_rect, cell, session);
             let mut selection = Selection::new(SelectionType::Simple, start, start_side);
             // 앵커를 누른 자리에 두고, 현재 위치까지 즉시 확장한다.
             selection.update(point, side);
@@ -192,6 +193,20 @@ impl TerminalWidget {
         let cols = (rect.width() / cell.x).floor().max(1.0) as u16;
         let rows = (rect.height() / cell.y).floor().max(1.0) as u16;
         session.resize(cols, rows);
+        // BUG-010: core는 그리드를 최소 줄 수(MIN_ROWS)보다 작게 만들지 않는다 — 영역이
+        // 그보다 낮으면 위쪽 줄을 숨기고 커서(입력) 줄이 보이게 그리드를 위로 올려 그린다.
+        // 그리기·마우스 좌표 변환은 grid_rect 기준, 잘라내기·자동 스크롤은 rect 기준.
+        let grid_rows = alacritty_terminal::grid::Dimensions::screen_lines(&session.term);
+        let hidden = rows_hidden_above(
+            grid_rows,
+            rows as usize,
+            session.term.grid().cursor.point.line.0,
+            session.term.grid().display_offset(),
+        );
+        let grid_rect = Rect::from_min_size(
+            Pos2::new(rect.left(), rect.top() - hidden as f32 * cell.y),
+            Vec2::new(rect.width(), grid_rows as f32 * cell.y),
+        );
 
         // 키/텍스트 입력 — 예광탄 범위: 일반 문자, Enter, Backspace, 방향키, Ctrl+C.
         // PageUp/PageDown/휠 스크롤은 셸로 보내는 게 아니라 로컬 스크롤백 뷰포트만
@@ -305,7 +320,7 @@ impl TerminalWidget {
             }
         }
 
-        self.handle_selection_mouse(ui, &response, session, rect, cell);
+        self.handle_selection_mouse(ui, &response, session, rect, grid_rect, cell);
 
         // 휠 스크롤 — 터미널 위에 마우스가 있을 때만(파일 패널 스크롤과 겹치지 않게).
         // smooth_scroll_delta.y가 양수(휠을 위로 밀어 화면이 아래로 내려가는 제스처)면
@@ -387,8 +402,8 @@ impl TerminalWidget {
                 continue;
             }
 
-            let x = rect.left() + point.column.0 as f32 * cell.x;
-            let y = rect.top() + viewport_line as f32 * cell.y;
+            let x = grid_rect.left() + point.column.0 as f32 * cell.x;
+            let y = grid_rect.top() + viewport_line as f32 * cell.y;
             let width = if flags.contains(Flags::WIDE_CHAR) { cell.x * 2.0 } else { cell.x };
 
             // 선택된 셀은 전경/배경을 뒤집어 그린다(DEV-012). 선택색을 따로 두면
@@ -424,9 +439,9 @@ impl TerminalWidget {
         // (스크롤백 열람 중에는 원래 실제 커서 위치가 안 보이는 게 자연스럽다).
         let cursor = content.cursor;
         let cursor_viewport_line = cursor.point.line.0 + display_offset;
-        if cursor_viewport_line >= 0 && cursor_viewport_line < rows as i32 {
-            let x = rect.left() + cursor.point.column.0 as f32 * cell.x;
-            let y = rect.top() + cursor_viewport_line as f32 * cell.y;
+        if cursor_viewport_line >= 0 && cursor_viewport_line < grid_rows as i32 {
+            let x = grid_rect.left() + cursor.point.column.0 as f32 * cell.x;
+            let y = grid_rect.top() + cursor_viewport_line as f32 * cell.y;
             let cursor_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell.x, cell.y));
             painter.rect_stroke(
                 cursor_rect,
@@ -515,6 +530,17 @@ impl Default for TerminalWidget {
 /// `Side`는 셀의 왼쪽 절반인지 오른쪽 절반인지로, 선택 경계가 글자 앞에서 끊기는지
 /// 뒤에서 끊기는지를 정한다 — 이게 없으면 드래그 시작점의 글자가 통째로 빠지거나
 /// 하나 더 붙는다.
+/// 영역에 다 안 들어가는 그리드에서 위로 숨길 줄 수(BUG-010). 커서 줄이 영역
+/// 맨 아래에 오도록 하되, 스크롤백을 보고 있을 때(`display_offset` > 0)는 숨기지
+/// 않는다 — 그땐 커서가 화면에 없고 사용자가 본 위치를 그대로 둬야 한다.
+fn rows_hidden_above(grid_rows: usize, visible_rows: usize, cursor_line: i32, display_offset: usize) -> usize {
+    if grid_rows <= visible_rows || display_offset != 0 {
+        return 0;
+    }
+    let cursor_line = cursor_line.max(0) as usize;
+    (cursor_line + 1).saturating_sub(visible_rows).min(grid_rows - visible_rows)
+}
+
 fn pos_to_cell(pos: Pos2, rect: Rect, cell: Vec2, session: &TerminalSession) -> (Point, Side) {
     use alacritty_terminal::grid::Dimensions;
 
@@ -558,6 +584,53 @@ fn claim_terminal_focus(ui: &mut egui::Ui, response: &egui::Response) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rows_hidden_above_keeps_cursor_row_visible() {
+        // 다 들어가면 숨길 것 없음
+        assert_eq!(rows_hidden_above(24, 24, 23, 0), 0);
+        // 4줄 그리드를 1줄 영역에: 커서가 3번째 줄(2)이면 위 2줄을 숨긴다
+        assert_eq!(rows_hidden_above(4, 1, 2, 0), 2);
+        assert_eq!(rows_hidden_above(4, 1, 3, 0), 3);
+        // 커서가 이미 보이는 범위면 숨기지 않는다
+        assert_eq!(rows_hidden_above(4, 2, 0, 0), 0);
+        // 스크롤백을 보는 중이면 그대로
+        assert_eq!(rows_hidden_above(4, 1, 3, 5), 0);
+    }
+
+    /// BUG-010: 터미널 영역을 한 줄 높이로 줄여도 커서(입력) 줄이 그 영역 안에
+    /// 그려져야 한다. 커서 자리는 IME 출력의 cursor_rect로 확인한다.
+    #[test]
+    fn one_row_terminal_shows_cursor_row() {
+        let ctx = egui::Context::default();
+        let mut widget = TerminalWidget::new();
+        widget.install_fonts(&ctx);
+        let mut session = TerminalSession::spawn(&syncshell_core::terminal::default_shell(), 80, 24, || {})
+            .expect("셸을 띄우지 못함");
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {}); // 폰트 준비(cell_size가 필요)
+        let cell = widget.cell_size(&ctx);
+        let rect = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(800.0, cell.y * 1.3));
+
+        let mut last = None;
+        for _ in 0..400 {
+            session.pump();
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(rect);
+            let out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| widget.show(ui, &mut session));
+            });
+            let cursor_line = session.term.grid().cursor.point.line.0;
+            last = Some((cursor_line, out.platform_output.ime.map(|i| i.cursor_rect)));
+            if let (line, Some(cursor)) = last.unwrap() {
+                // 커서가 첫 줄이 아닐 때(=예전엔 영역 밖으로 잘리던 경우)를 확인해야 의미가 있다
+                if line >= 1 && rect.expand(0.5).contains_rect(cursor) {
+                    return;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("한 줄 높이 터미널에서 커서 줄이 영역 안에 안 그려짐: (커서 줄, 커서 영역)={last:?}, 터미널={rect:?}");
+    }
 
     /// BUG-007: 터미널이 이미 포커스를 가진 뒤에는 IME 조합 중단을 요청하지 않아야
     /// 한다 — 매 프레임 요청하면 egui-winit이 IME를 껐다 켜 한글 조합이 계속 취소된다.
