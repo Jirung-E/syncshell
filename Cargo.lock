@@ -3410,6 +3410,7 @@ dependencies = [
  "rustix 0.38.44",
  "serde",
  "toml",
+ "toml_edit 0.22.27",
  "trash",
  "windows-sys 0.60.2",
 ]

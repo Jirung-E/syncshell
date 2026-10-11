@@ -77,6 +77,9 @@ fn hide_dir_windows(path: &Path) {
 pub struct Config {
     /// 지정하면 `default_shell()`의 자동 판단보다 우선한다.
     pub default_shell: Option<String>,
+    /// 즐겨찾기 폴더(DEV-028). 사람이 직접 고쳐도 되고, 앱도 추가·제거 때
+    /// [`save_favorites`]로 이 항목만 고쳐 쓴다(다른 내용·주석은 보존).
+    pub favorites: Vec<PathBuf>,
 }
 
 /// 앱이 종료 시 덮어쓰는 상태. 예전 버전이 남긴 `tabs`·`active_tab`은 모르는
@@ -139,6 +142,35 @@ pub fn load_config() -> Config {
             Config::default()
         }
     }
+}
+
+/// `config.toml`의 `favorites`만 바꿔 쓴다(DEV-028). 사람이 쓰는 파일이라 통째로
+/// 다시 직렬화하지 않고 `toml_edit`으로 그 항목만 고친다 — 다른 설정, 주석, 순서는
+/// 그대로 남는다. 파일이 지금 TOML로 안 읽히면(사람이 고치다 만 상태 등) 덮어쓰지
+/// 않고 오류를 돌려준다.
+pub fn save_favorites(favorites: &[PathBuf]) -> std::io::Result<()> {
+    ensure_home_dir()?;
+    let path = config_path();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(std::io::Error::other)?;
+    let mut array = toml_edit::Array::new();
+    for fav in favorites {
+        array.push(fav.to_string_lossy().as_ref());
+    }
+    // 여러 개면 한 줄에 하나씩 — 사람이 읽고 고치기 쉽게.
+    for value in array.iter_mut() {
+        value.decor_mut().set_prefix("\n    ");
+    }
+    array.set_trailing("\n");
+    array.set_trailing_comma(true);
+    doc["favorites"] = toml_edit::value(array);
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, doc.to_string())?;
+    std::fs::rename(&tmp, &path)
 }
 
 /// `state.toml`을 읽는다. `load_config`와 같은 이유로 없거나 손상되면 기본값
@@ -305,6 +337,42 @@ pub(crate) mod tests {
             save_state(&state).unwrap();
             let text = std::fs::read_to_string(dir.join("state.toml")).unwrap();
             assert!(!text.contains("tabs"), "다시 저장했는데 탭 목록이 남음: {text}");
+        });
+    }
+
+    #[test]
+    fn save_favorites_keeps_other_settings_and_comments() {
+        with_syncshell_home(|dir| {
+            let original = "# 내 설정\ndefault_shell = \"/bin/zsh\" # 주석\n";
+            std::fs::write(dir.join("config.toml"), original).unwrap();
+            let favs = vec![PathBuf::from("/tmp"), PathBuf::from("/Users/x/한글 폴더")];
+            save_favorites(&favs).unwrap();
+
+            let text = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+            assert!(text.starts_with(original), "기존 내용·주석이 바뀜:\n{text}");
+            let config = load_config();
+            assert_eq!(config.favorites, favs);
+            assert_eq!(config.default_shell.as_deref(), Some("/bin/zsh"));
+
+            // 다시 쓰면 교체(중복으로 쌓이지 않음), 비우기도 가능
+            save_favorites(&favs[..1]).unwrap();
+            assert_eq!(load_config().favorites, favs[..1].to_vec());
+            save_favorites(&[]).unwrap();
+            assert!(load_config().favorites.is_empty());
+            assert!(!dir.join("config.toml.tmp").exists());
+        });
+    }
+
+    #[test]
+    fn save_favorites_creates_missing_config_and_refuses_broken_one() {
+        with_syncshell_home(|dir| {
+            save_favorites(&[PathBuf::from("/tmp")]).unwrap();
+            assert_eq!(load_config().favorites, vec![PathBuf::from("/tmp")]);
+
+            let broken = "favorites = [ \"/tmp\"\n";
+            std::fs::write(dir.join("config.toml"), broken).unwrap();
+            assert!(save_favorites(&[]).is_err(), "깨진 파일을 덮어씀");
+            assert_eq!(std::fs::read_to_string(dir.join("config.toml")).unwrap(), broken);
         });
     }
 

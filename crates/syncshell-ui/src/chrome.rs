@@ -31,6 +31,9 @@ pub enum Icon {
     Minimize,
     Maximize,
     Restore,
+    /// 즐겨찾기(DEV-028) — 빈 별 / 채운 별
+    Star,
+    StarFilled,
 }
 
 /// `rect` 안에 아이콘을 그린다. 좌표는 16×16 격자 기준으로 잡고 rect 크기에
@@ -74,6 +77,29 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
         Icon::File => {
             poly(&[(4.0, 2.0), (9.5, 2.0), (12.5, 5.0), (12.5, 14.0), (4.0, 14.0)], true);
             poly(&[(9.5, 2.0), (9.5, 5.0), (12.5, 5.0)], false);
+        }
+        Icon::Star | Icon::StarFilled => {
+            // 꼭짓점 5개 + 안쪽 5개를 번갈아 잇는 별. 채울 때는 가운데에서 부채꼴로
+            // 삼각형을 만든다(오목 다각형이라 convex_polygon으로는 못 채움).
+            let pts: Vec<Pos2> = (0..10)
+                .map(|i| {
+                    let r = if i % 2 == 0 { 6.5 } else { 2.8 };
+                    let a = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::PI / 5.0;
+                    p(8.0 + a.cos() * r, 8.6 + a.sin() * r)
+                })
+                .collect();
+            if icon == Icon::StarFilled {
+                let mut mesh = egui::Mesh::default();
+                mesh.colored_vertex(p(8.0, 8.6), color);
+                for q in &pts {
+                    mesh.colored_vertex(*q, color);
+                }
+                for i in 0..10u32 {
+                    mesh.add_triangle(0, 1 + i, 1 + (i + 1) % 10);
+                }
+                painter.add(mesh);
+            }
+            painter.add(egui::Shape::closed_line(pts, stroke));
         }
         Icon::Close => {
             poly(&[(4.5, 4.5), (11.5, 11.5)], false);

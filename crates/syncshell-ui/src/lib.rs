@@ -191,6 +191,8 @@ impl Tab {
                 ctx.copy_text(path.display().to_string());
                 self.panel.set_info("경로를 복사했습니다");
             }
+            // 즐겨찾기는 앱 전역 — SyncShellApp이 먼저 가로채 처리한다.
+            FileAction::AddFavorite(_) | FileAction::RemoveFavorite(_) => {}
             FileAction::BeginRename(path) => {
                 self.panel.begin_rename(&path);
             }
@@ -364,6 +366,8 @@ pub struct SyncShellApp {
     wheel_zoom: f32,
     /// 지금 모으고 있는 휠 확대의 대상(true = UI 배율, false = 터미널 글자).
     wheel_target_ui: Option<bool>,
+    /// 즐겨찾기 폴더(DEV-028). 탭과 무관한 앱 전역 목록, `config.toml`에 저장.
+    favorites: Vec<PathBuf>,
 }
 
 /// [`Tab::sync_status`] 참고.
@@ -463,6 +467,7 @@ impl SyncShellApp {
             scale,
             wheel_zoom: 1.0,
             wheel_target_ui: None,
+            favorites: config.favorites,
         }
     }
 
@@ -894,6 +899,27 @@ fn status_bar(ui: &mut egui::Ui, pal: &theme::Palette, tab: &Tab, profile: Optio
     picked
 }
 
+/// 즐겨찾기 추가·제거를 목록에 반영하고 `config.toml`에 저장한다(DEV-028).
+/// 저장에 실패해도 이번 실행 동안은 목록에 반영된 채로 두고 오류 문구를 돌려준다.
+fn apply_favorite_action(favorites: &mut Vec<PathBuf>, action: &FileAction) -> Result<String, String> {
+    let msg = match action {
+        FileAction::AddFavorite(path) => {
+            if !favorites.contains(path) {
+                favorites.push(path.clone());
+            }
+            format!("'{}'을(를) 즐겨찾기에 추가했습니다", display_name(path))
+        }
+        FileAction::RemoveFavorite(path) => {
+            favorites.retain(|p| p != path);
+            format!("'{}'을(를) 즐겨찾기에서 뺐습니다", display_name(path))
+        }
+        _ => return Ok(String::new()),
+    };
+    syncshell_core::session::save_favorites(favorites)
+        .map(|()| msg)
+        .map_err(|e| format!("즐겨찾기를 저장하지 못했습니다(config.toml 확인): {e}"))
+}
+
 /// 현재 경로 복사 단축키 표기(DEV-027). VS Code "경로 복사"와 같은 키.
 fn copy_path_shortcut_label() -> &'static str {
     if cfg!(target_os = "macos") {
@@ -1081,11 +1107,20 @@ impl eframe::App for SyncShellApp {
             // 보기 방식은 앱 전역이라 패널에 넣어주고, 패널 안의 전환 버튼으로
             // 바뀌었으면 다시 가져온다.
             active.panel.view_mode = self.view_mode;
+            active.panel.favorites.clone_from(&self.favorites);
             action = file_panel::show(ui, &active.fs, &mut active.panel, panel_active);
             self.view_mode = active.panel.view_mode;
         });
         if let Some(action) = action {
-            active.handle_file_action(ui.ctx(), action);
+            match action {
+                FileAction::AddFavorite(_) | FileAction::RemoveFavorite(_) => {
+                    match apply_favorite_action(&mut self.favorites, &action) {
+                        Ok(msg) => active.panel.set_info(msg),
+                        Err(msg) => active.panel.set_error(msg),
+                    }
+                }
+                other => active.handle_file_action(ui.ctx(), other),
+            }
         }
 
         // 터미널 안쪽 여백(DEV-025). 여백도 터미널 바탕색으로 칠해 한 덩어리로
@@ -1282,6 +1317,7 @@ mod tests {
             scale: scale::Scale::default(),
             wheel_zoom: 1.0,
             wheel_target_ui: None,
+            favorites: Vec::new(),
         };
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, TAB_BAR_HEIGHT));
         let mut frame = |events: Vec<egui::Event>| {
@@ -1425,6 +1461,7 @@ mod tests {
             scale: scale::Scale::default(),
             wheel_zoom: 1.0,
             wheel_target_ui: None,
+            favorites: Vec::new(),
         };
         assert_eq!(app.wheel_scale_action(1.2, false, true, true), Some(FontIn), "터미널 위 Ctrl+휠 = 글자");
         assert_eq!(app.wheel_scale_action(0.8, false, true, false), Some(UiOut), "터미널 밖 Ctrl+휠 = UI 배율");
@@ -1467,6 +1504,7 @@ mod tests {
             scale: scale::Scale::default(),
             wheel_zoom: 1.0,
             wheel_target_ui: None,
+            favorites: Vec::new(),
         };
         theme::apply(&ctx, ThemeMode::Dark);
         assert_eq!(ctx.global_style().visuals.panel_fill, theme::DARK.panel);
@@ -1512,6 +1550,7 @@ mod tests {
             scale: scale::Scale::default(),
             wheel_zoom: 1.0,
             wheel_target_ui: None,
+            favorites: Vec::new(),
         };
         assert_eq!(app.tabs.len(), 1);
 
@@ -1574,6 +1613,7 @@ mod tests {
             scale: scale::Scale::default(),
             wheel_zoom: 1.0,
             wheel_target_ui: None,
+            favorites: Vec::new(),
         };
 
         app.on_exit();

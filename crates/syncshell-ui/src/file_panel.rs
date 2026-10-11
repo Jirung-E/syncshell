@@ -30,6 +30,9 @@ pub enum FileAction {
     Cut(PathBuf),
     /// 클립보드에 담긴 걸 현재 폴더에 붙여넣는다.
     Paste,
+    /// 즐겨찾기에 추가 / 제거(DEV-028). 목록은 앱 전역이라 앱이 처리한다.
+    AddFavorite(PathBuf),
+    RemoveFavorite(PathBuf),
 }
 
 /// 잘라내기/복사로 클립보드에 담긴 항목(DEV-008).
@@ -78,6 +81,9 @@ pub struct FilePanelState {
     /// 보여줄지(실사용 요청: "아이콘뷰가 필요함", DEV-022). 앱 전역 설정이라
     /// 호출부(`SyncShellApp`)가 매 프레임 넣어주고 바뀌면 다시 읽어간다.
     pub view_mode: ViewMode,
+    /// 즐겨찾기 폴더(DEV-028). `view_mode`처럼 앱 전역 값을 호출부가 매 프레임
+    /// 넣어준다 — 추가·제거는 `FileAction`으로 앱에 돌려보낸다.
+    pub favorites: Vec<PathBuf>,
 }
 
 /// [`FilePanelState::view_mode`] 참고.
@@ -126,6 +132,7 @@ impl Default for FilePanelState {
             tree_tx,
             tree_for: None,
             view_mode: ViewMode::Tree,
+            favorites: Vec::new(),
         }
     }
 }
@@ -201,7 +208,9 @@ pub fn show(ui: &mut egui::Ui, fs: &FsView, state: &mut FilePanelState, panel_ac
     let pal = theme::current(ui);
     ui.horizontal(|ui| {
         const SEGMENT_W: f32 = 2.0 * 28.0 + 4.0;
-        let box_w = (ui.available_width() - SEGMENT_W - ui.spacing().item_spacing.x).max(40.0);
+        const STAR_W: f32 = 26.0;
+        let box_w = (ui.available_width() - SEGMENT_W - STAR_W - 2.0 * ui.spacing().item_spacing.x).max(40.0);
+        let is_fav = state.favorites.contains(&fs.current_dir);
         ui.allocate_ui_with_layout(vec2(box_w, 28.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
             egui::Frame::NONE
                 .fill(pal.bg)
@@ -210,9 +219,31 @@ pub fn show(ui: &mut egui::Ui, fs: &FsView, state: &mut FilePanelState, panel_ac
                 .inner_margin(egui::Margin::symmetric(6, 3))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    breadcrumb(ui, &fs.current_dir, &mut action, state.clipboard.is_some());
+                    breadcrumb(ui, &fs.current_dir, &mut action, state.clipboard.is_some(), is_fav);
                 });
         });
+        // 현재 폴더 즐겨찾기 켜고 끄기(DEV-028).
+        let (star, tip) = if is_fav {
+            (Icon::StarFilled, "즐겨찾기에서 제거")
+        } else {
+            (Icon::Star, "현재 폴더를 즐겨찾기에 추가")
+        };
+        let (star_rect, star_resp) = ui.allocate_exact_size(vec2(STAR_W, 26.0), egui::Sense::click());
+        let star_resp = star_resp.on_hover_text(tip);
+        #[cfg(test)]
+        tests::record_star_rect_for_test(star_rect);
+        if star_resp.hovered() {
+            ui.painter().rect_filled(star_rect, 5.0, pal.hover);
+        }
+        let star_color = if is_fav { pal.accent } else if star_resp.hovered() { pal.text } else { pal.muted };
+        chrome::paint_icon(ui.painter(), egui::Rect::from_center_size(star_rect.center(), vec2(15.0, 15.0)), star, star_color);
+        if star_resp.clicked() {
+            action = Some(if is_fav {
+                FileAction::RemoveFavorite(fs.current_dir.clone())
+            } else {
+                FileAction::AddFavorite(fs.current_dir.clone())
+            });
+        }
         // 트리/아이콘 전환. 글리프 대신 painter로 그린 아이콘이라 폰트에 없는
         // 기호가 두부로 나올 걱정이 없다(chrome.rs 참고).
         let picked = chrome::segmented(
@@ -229,6 +260,10 @@ pub fn show(ui: &mut egui::Ui, fs: &FsView, state: &mut FilePanelState, panel_ac
             _ => {}
         }
     });
+
+    if !state.favorites.is_empty() {
+        favorites_bar(ui, fs, state, &mut action);
+    }
 
     if let Some(msg) = state.status.clone() {
         // 테마(DEV-021)를 따른다 — 고정 색이면 라이트 모드에서 연두색 안내
@@ -485,8 +520,9 @@ fn tree_row(
         handle_entry_click(entry, &response, state, action);
     }
 
+    let is_fav = state.favorites.contains(&entry.path);
     response.context_menu(|ui| {
-        if let Some(picked) = entry_menu(ui, &entry.path, entry.is_dir) {
+        if let Some(picked) = entry_menu(ui, &entry.path, entry.is_dir, is_fav) {
             *action = Some(picked);
             ui.close();
         }
@@ -586,8 +622,9 @@ fn icon_cell(
 
     handle_entry_click(entry, &response, state, action);
 
+    let is_fav = state.favorites.contains(&entry.path);
     response.context_menu(|ui| {
-        if let Some(picked) = entry_menu(ui, &entry.path, entry.is_dir) {
+        if let Some(picked) = entry_menu(ui, &entry.path, entry.is_dir, is_fav) {
             *action = Some(picked);
             ui.close();
         }
@@ -603,7 +640,7 @@ fn icon_cell(
 /// 안정적으로 안 잡힌다(가상 스크롤 도입 전엔 폭 전체를 쓰는 라벨 하나였어서
 /// 문제 없었지만, 지금은 세그먼트별 버튼들의 모음이라 컨테이너 전체에 붙이면
 /// 안쪽 버튼에 클릭이 먼저 먹혀 컨테이너까지 안 올라옴).
-fn breadcrumb(ui: &mut egui::Ui, current_dir: &Path, action: &mut Option<FileAction>, has_clipboard: bool) {
+fn breadcrumb(ui: &mut egui::Ui, current_dir: &Path, action: &mut Option<FileAction>, has_clipboard: bool, is_fav: bool) {
     let ancestors: Vec<PathBuf> = current_dir.ancestors().map(|p| p.to_path_buf()).collect();
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
@@ -630,7 +667,7 @@ fn breadcrumb(ui: &mut egui::Ui, current_dir: &Path, action: &mut Option<FileAct
             }
             if is_current {
                 response.context_menu(|ui| {
-                    if let Some(picked) = background_menu(ui, current_dir, has_clipboard) {
+                    if let Some(picked) = background_menu(ui, current_dir, has_clipboard, is_fav) {
                         *action = Some(picked);
                         ui.close();
                     }
@@ -721,7 +758,7 @@ fn format_modified(t: std::time::SystemTime) -> String {
 }
 
 /// 항목(폴더/파일) 우클릭 메뉴.
-fn entry_menu(ui: &mut egui::Ui, path: &Path, is_dir: bool) -> Option<FileAction> {
+fn entry_menu(ui: &mut egui::Ui, path: &Path, is_dir: bool, is_fav: bool) -> Option<FileAction> {
     let mut action = None;
     ui.set_min_width(180.0);
 
@@ -757,13 +794,86 @@ fn entry_menu(ui: &mut egui::Ui, path: &Path, is_dir: bool) -> Option<FileAction
     if ui.button("경로 복사").clicked() {
         action = Some(FileAction::CopyPath(path.to_path_buf()));
     }
+    if is_dir {
+        if let Some(picked) = favorite_menu_item(ui, path, is_fav) {
+            action = Some(picked);
+        }
+    }
 
     action
 }
 
+/// "즐겨찾기에 추가" / "즐겨찾기에서 제거" 메뉴 한 줄(DEV-028).
+fn favorite_menu_item(ui: &mut egui::Ui, path: &Path, is_fav: bool) -> Option<FileAction> {
+    if is_fav {
+        ui.button("즐겨찾기에서 제거").clicked().then(|| FileAction::RemoveFavorite(path.to_path_buf()))
+    } else {
+        ui.button("즐겨찾기에 추가").clicked().then(|| FileAction::AddFavorite(path.to_path_buf()))
+    }
+}
+
+/// 경로바 아래 즐겨찾기 줄(DEV-028). 넘치면 가로로 스크롤한다. 지금 폴더인 칸은
+/// 강조, 폴더가 없어진 칸은 흐리게 — 누르면 이동 대신 안내만 띄운다.
+fn favorites_bar(ui: &mut egui::Ui, fs: &FsView, state: &mut FilePanelState, action: &mut Option<FileAction>) {
+    let pal = theme::current(ui);
+    let favorites = state.favorites.clone();
+    egui::ScrollArea::horizontal().id_salt("favorites_bar").scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for fav in &favorites {
+                let exists = fav.is_dir();
+                let is_current = *fav == fs.current_dir;
+                let name = fav
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| fav.display().to_string());
+                let color = if !exists { pal.faint } else if is_current { pal.text } else { pal.muted };
+                let font = egui::FontId::proportional(12.0);
+                let galley = ui.painter().layout_no_wrap(name, font, color);
+                let size = vec2(galley.size().x + 30.0, 22.0);
+                let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+                let hint = if exists { fav.display().to_string() } else { format!("{}\n폴더가 없습니다", fav.display()) };
+                let resp = resp.on_hover_text(hint);
+                let fill = if is_current {
+                    pal.segment_on
+                } else if resp.hovered() {
+                    pal.hover
+                } else {
+                    Color32::TRANSPARENT
+                };
+                ui.painter().rect(rect, 5.0, fill, egui::Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
+                let icon_rect = egui::Rect::from_center_size(egui::pos2(rect.left() + 13.0, rect.center().y), vec2(13.0, 13.0));
+                chrome::paint_icon(ui.painter(), icon_rect, Icon::Folder, if exists { pal.accent } else { pal.faint });
+                ui.painter().galley(egui::pos2(rect.left() + 23.0, rect.center().y - galley.size().y / 2.0), galley, color);
+                #[cfg(test)]
+                tests::record_favorite_rect_for_test(fav, rect);
+
+                if resp.clicked() && !is_current {
+                    if exists {
+                        *action = Some(FileAction::Navigate(fav.clone()));
+                    } else {
+                        state.set_error(format!("폴더가 없습니다: {}", fav.display()));
+                    }
+                }
+                resp.context_menu(|ui| {
+                    ui.set_min_width(160.0);
+                    if ui.button("경로 복사").clicked() {
+                        *action = Some(FileAction::CopyPath(fav.clone()));
+                        ui.close();
+                    }
+                    if ui.button("즐겨찾기에서 제거").clicked() {
+                        *action = Some(FileAction::RemoveFavorite(fav.clone()));
+                        ui.close();
+                    }
+                });
+            }
+        });
+    });
+}
+
 /// 빈 공간 우클릭 메뉴(현재 폴더 대상). `has_clipboard`가 false면 "붙여넣기"는
 /// 눌러도 반응 없는 상태로 보여준다(비활성화) — 일반 탐색기와 같은 감각.
-fn background_menu(ui: &mut egui::Ui, current_dir: &Path, has_clipboard: bool) -> Option<FileAction> {
+fn background_menu(ui: &mut egui::Ui, current_dir: &Path, has_clipboard: bool, is_fav: bool) -> Option<FileAction> {
     let mut action = None;
     ui.set_min_width(180.0);
 
@@ -779,6 +889,9 @@ fn background_menu(ui: &mut egui::Ui, current_dir: &Path, has_clipboard: bool) -
     }
     if ui.button("현재 경로 복사").clicked() {
         action = Some(FileAction::CopyPath(current_dir.to_path_buf()));
+    }
+    if let Some(picked) = favorite_menu_item(ui, current_dir, is_fav) {
+        action = Some(picked);
     }
 
     action
@@ -1100,6 +1213,77 @@ mod tests {
 
     pub(super) fn record_chevron_rect_for_test(path: &Path, rect: egui::Rect) {
         CHEVRON_RECTS.with(|m| m.borrow_mut().insert(path.to_path_buf(), rect));
+    }
+
+    thread_local! {
+        /// 즐겨찾기 줄의 칸별 클릭 영역(DEV-028).
+        static FAVORITE_RECTS: std::cell::RefCell<std::collections::HashMap<PathBuf, egui::Rect>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+
+    pub(super) fn record_favorite_rect_for_test(path: &Path, rect: egui::Rect) {
+        FAVORITE_RECTS.with(|m| m.borrow_mut().insert(path.to_path_buf(), rect));
+    }
+
+    thread_local! {
+        static STAR_RECT: std::cell::Cell<Option<egui::Rect>> = const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn record_star_rect_for_test(rect: egui::Rect) {
+        STAR_RECT.with(|c| c.set(Some(rect)));
+    }
+
+    /// 한 프레임 그려 즐겨찾기 별 버튼·즐겨찾기 칸 위치를 기록한다.
+    fn probe_favorites(ctx: &egui::Context, fs: &FsView, favorites: &[PathBuf]) {
+        FAVORITE_RECTS.with(|m| m.borrow_mut().clear());
+        STAR_RECT.with(|c| c.set(None));
+        let mut state = FilePanelState { favorites: favorites.to_vec(), ..Default::default() };
+        let mut probe = egui::RawInput::default();
+        probe.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 600.0)));
+        let _ = ctx.run_ui(probe, |ui| {
+            let _ = show(ui, fs, &mut state, true);
+        });
+    }
+
+    /// DEV-028: 별 버튼은 현재 폴더를 즐겨찾기에 넣고, 이미 들어 있으면 뺀다.
+    #[test]
+    fn star_button_toggles_current_folder_favorite() {
+        let base = temp_dir_with("fav-star", &["a.txt"]);
+        let fs = settled_view(&base);
+        let ctx = egui::Context::default();
+
+        probe_favorites(&ctx, &fs, &[]);
+        let star = STAR_RECT.with(|c| c.get()).expect("별 버튼이 안 그려짐").center();
+        let mut state = FilePanelState::default();
+        assert_eq!(click_at(&ctx, &fs, &mut state, star, false), Some(FileAction::AddFavorite(base.clone())));
+
+        let mut state = FilePanelState { favorites: vec![base.clone()], ..Default::default() };
+        assert_eq!(click_at(&ctx, &fs, &mut state, star, false), Some(FileAction::RemoveFavorite(base.clone())));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// DEV-028: 즐겨찾기 칸을 누르면 그 폴더로 이동하고, 없어진 폴더는 이동 대신
+    /// 안내만 띄운다.
+    #[test]
+    fn favorite_chip_navigates_and_missing_one_only_warns() {
+        let base = temp_dir_with("fav-chip", &["there/"]);
+        let there = base.join("there");
+        let gone = base.join("gone");
+        let fs = settled_view(&base);
+        let ctx = egui::Context::default();
+        let favorites = vec![there.clone(), gone.clone()];
+
+        probe_favorites(&ctx, &fs, &favorites);
+        let pos = |p: &Path| FAVORITE_RECTS.with(|m| m.borrow().get(p).copied()).expect("즐겨찾기 칸이 안 그려짐").center();
+        let (there_pos, gone_pos) = (pos(&there), pos(&gone));
+
+        let mut state = FilePanelState { favorites: favorites.clone(), ..Default::default() };
+        assert_eq!(click_at(&ctx, &fs, &mut state, there_pos, false), Some(FileAction::Navigate(there.clone())));
+
+        let mut state = FilePanelState { favorites, ..Default::default() };
+        assert_eq!(click_at(&ctx, &fs, &mut state, gone_pos, false), None, "없는 폴더로 이동하려 함");
+        assert!(state.status_is_error && state.status.as_deref().is_some_and(|m| m.contains("없습니다")));
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// 첫 번째 항목 행이 실제로 어디 그려지는지, 실제 프로덕션 `show()`를 한 번

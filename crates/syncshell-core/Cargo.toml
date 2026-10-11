@@ -14,6 +14,8 @@ trash = "5"
 # 세션/설정 저장(DEV-010) — config.toml/state.toml 직렬화.
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# 앱이 config.toml을 고칠 때(즐겨찾기, DEV-028) 사용자 주석·순서를 보존한다.
+toml_edit = "0.22"
 
 [target.'cfg(unix)'.dependencies]
 # alacritty_terminal이 쓰는 rustix-openpty가 유닉스 타깃에서 rustix 0.38을
