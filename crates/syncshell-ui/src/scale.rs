@@ -5,6 +5,8 @@
 //!
 //! 단축키: 터미널 글자 Ctrl/Cmd + = − 0(일반 터미널 관례), UI 배율 Ctrl/Cmd +
 //! Shift + = − 0. egui 기본 키보드 확대는 같은 키를 쓰므로 끈다.
+//! 휠: Ctrl/Cmd+휠은 터미널 위면 글자, 밖이면 UI 배율. Ctrl/Cmd+Shift+휠은 어디서든
+//! UI 배율(lib.rs).
 
 use eframe::egui;
 
@@ -134,7 +136,7 @@ pub fn status_menu(ui: &mut egui::Ui, scale: &Scale, font: egui::FontId, color: 
             ScaleAction::UiOut,
             ScaleAction::UiIn,
             ScaleAction::UiReset,
-            format!("{key}+Shift+= / − / 0"),
+            format!("{key}+Shift+= / − / 0, {key}+Shift+휠, 터미널 밖에서 {key}+휠"),
         );
         ui.separator();
         row(
@@ -144,7 +146,7 @@ pub fn status_menu(ui: &mut egui::Ui, scale: &Scale, font: egui::FontId, color: 
             ScaleAction::FontOut,
             ScaleAction::FontIn,
             ScaleAction::FontReset,
-            format!("{key}+= / − / 0, {key}+휠"),
+            format!("{key}+= / − / 0, 터미널 위에서 {key}+휠"),
         );
     });
     picked

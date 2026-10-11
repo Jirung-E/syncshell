@@ -362,6 +362,8 @@ pub struct SyncShellApp {
     /// Ctrl/Cmd+휠로 들어온 확대 비율을 모아 두는 곳 — 한 칸(약 10%)이 쌓일 때마다
     /// 터미널 글자를 1씩 바꾼다(휠 한 번에 글자가 여러 단계 튀지 않게).
     wheel_zoom: f32,
+    /// 지금 모으고 있는 휠 확대의 대상(true = UI 배율, false = 터미널 글자).
+    wheel_target_ui: Option<bool>,
 }
 
 /// [`Tab::sync_status`] 참고.
@@ -479,6 +481,7 @@ impl SyncShellApp {
             no_ime: std::env::var("SYNCSHELL_NO_IME").is_ok_and(|v| !v.is_empty() && v != "0"),
             scale,
             wheel_zoom: 1.0,
+            wheel_target_ui: None,
         }
     }
 
@@ -508,6 +511,35 @@ impl SyncShellApp {
                 term_font_size: Some(self.scale.font.round() as f64),
             },
         }
+    }
+
+    /// 이번 프레임의 Ctrl/Cmd+휠 확대량(`zoom`)을 모아, 한 칸(약 10%)이 쌓이면 배율
+    /// 동작을 돌려준다. 대상은 Shift가 눌렸거나 터미널 밖이면 UI 배율, 터미널 위면
+    /// 터미널 글자. 대상이 바뀌면 모아 둔 양을 버린다(터미널에서 굴리던 게 UI로
+    /// 넘어가지 않게).
+    fn wheel_scale_action(&mut self, zoom: f32, shift: bool, in_window: bool, over_terminal: bool) -> Option<scale::ScaleAction> {
+        let target_ui = shift || !over_terminal;
+        if zoom != 1.0 && in_window {
+            if self.wheel_target_ui != Some(target_ui) {
+                self.wheel_zoom = 1.0;
+                self.wheel_target_ui = Some(target_ui);
+            }
+            self.wheel_zoom *= zoom;
+        }
+        let grow = if self.wheel_zoom >= 1.1 {
+            true
+        } else if self.wheel_zoom <= 1.0 / 1.1 {
+            false
+        } else {
+            return None;
+        };
+        self.wheel_zoom = 1.0;
+        Some(match (self.wheel_target_ui == Some(true), grow) {
+            (true, true) => scale::ScaleAction::UiIn,
+            (true, false) => scale::ScaleAction::UiOut,
+            (false, true) => scale::ScaleAction::FontIn,
+            (false, false) => scale::ScaleAction::FontOut,
+        })
     }
 
     fn apply_scale(&mut self, ctx: &egui::Context, action: scale::ScaleAction) {
@@ -1009,25 +1041,14 @@ impl eframe::App for SyncShellApp {
 
         active.handle_dropped_files(ui.ctx(), central.response.rect);
 
-        // 터미널 위에서 Ctrl/Cmd+휠 = 터미널 글자 크기(DEV-026). egui는 Ctrl+휠을
-        // 스크롤 대신 zoom_delta로 넘겨주므로 터미널 스크롤과 겹치지 않는다.
-        let wheel_action = if central.response.contains_pointer() {
-            let z = ui.ctx().input(|i| i.zoom_delta());
-            if z != 1.0 {
-                self.wheel_zoom *= z;
-            }
-            if self.wheel_zoom >= 1.1 {
-                self.wheel_zoom = 1.0;
-                Some(scale::ScaleAction::FontIn)
-            } else if self.wheel_zoom <= 1.0 / 1.1 {
-                self.wheel_zoom = 1.0;
-                Some(scale::ScaleAction::FontOut)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        // Ctrl/Cmd+휠(DEV-026): 터미널 위면 터미널 글자, 그 밖(탐색기·탭 바·상태바)이면
+        // UI 배율 — 커서 아래를 확대한다는 느낌. Ctrl/Cmd+Shift+휠은 어디서든 UI 배율
+        // (키보드 Ctrl/Cmd+Shift+= −와 맞춤). egui는 Ctrl+휠을 스크롤 대신 zoom_delta로
+        // 넘겨주고(가로·세로를 합쳐서 — Shift 때문에 휠이 가로로 바뀌어 와도 잡힘),
+        // 그동안 일반 스크롤은 0이라 터미널·탐색기가 같이 스크롤되지 않는다.
+        let (wheel_zoom, wheel_shift, wheel_in_window) =
+            ui.ctx().input(|i| (i.zoom_delta(), i.modifiers.shift, i.pointer.hover_pos().is_some()));
+        let over_terminal = central.response.contains_pointer();
 
         // 이번 프레임에 클릭이 있었으면, 그 위치로 "지금 어느 패널을 쓰고
         // 있는지"를 갱신한다 — 다음 프레임의 복사/붙여넣기 단축키 판단에 쓰인다
@@ -1042,7 +1063,7 @@ impl eframe::App for SyncShellApp {
             }
         }
 
-        if let Some(wheel_action) = wheel_action {
+        if let Some(wheel_action) = self.wheel_scale_action(wheel_zoom, wheel_shift, wheel_in_window, over_terminal) {
             self.apply_scale(&ui.ctx().clone(), wheel_action);
         }
 
@@ -1194,6 +1215,7 @@ mod tests {
             no_ime: false,
             scale: scale::Scale::default(),
             wheel_zoom: 1.0,
+            wheel_target_ui: None,
         };
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, TAB_BAR_HEIGHT));
         let mut frame = |events: Vec<egui::Event>| {
@@ -1274,6 +1296,39 @@ mod tests {
         assert!(back.width() > 600.0, "다시 좌우로 돌아왔는데 터미널 폭이 이상함: {back:?}");
     }
 
+    /// DEV-026: Ctrl/Cmd+휠 — 터미널 위는 글자, 밖이나 Shift면 UI 배율. 작은 휠
+    /// 움직임은 모았다가 한 칸이 되면 한 단계, 대상이 바뀌면 모은 양을 버린다.
+    #[test]
+    fn ctrl_wheel_targets_font_over_terminal_and_ui_elsewhere() {
+        use scale::ScaleAction::*;
+        let ctx = egui::Context::default();
+        let mut app = SyncShellApp {
+            tabs: vec![Tab::new(&ctx, std::env::temp_dir(), None)],
+            active: 0,
+            default_shell: None,
+            last_window_rect: None,
+            panel_layout: PanelLayout::default(),
+            theme: ThemeMode::Dark,
+            view_mode: ViewMode::Tree,
+            profiler: None,
+            selftest: None,
+            no_ime: false,
+            scale: scale::Scale::default(),
+            wheel_zoom: 1.0,
+            wheel_target_ui: None,
+        };
+        assert_eq!(app.wheel_scale_action(1.2, false, true, true), Some(FontIn), "터미널 위 Ctrl+휠 = 글자");
+        assert_eq!(app.wheel_scale_action(0.8, false, true, false), Some(UiOut), "터미널 밖 Ctrl+휠 = UI 배율");
+        assert_eq!(app.wheel_scale_action(1.2, true, true, true), Some(UiIn), "Ctrl+Shift+휠은 터미널 위에서도 UI 배율");
+        // 작은 움직임은 모았다가 한 칸이 되면 한 단계
+        assert_eq!(app.wheel_scale_action(1.05, false, true, true), None);
+        assert_eq!(app.wheel_scale_action(1.05, false, true, true), Some(FontIn));
+        // 터미널에서 모으던 게 UI로 넘어가지 않음
+        assert_eq!(app.wheel_scale_action(1.06, false, true, true), None);
+        assert_eq!(app.wheel_scale_action(1.06, false, true, false), None, "대상이 바뀌었는데 모아 둔 양이 이어짐");
+        assert_eq!(app.wheel_scale_action(1.0, false, false, false), None, "휠 없음");
+    }
+
     /// DEV-020/023: 분할 모양 선택이 `state.toml` 문자열로 왕복되는지.
     #[test]
     fn panel_layout_round_trips_through_string_and_defaults_to_side() {
@@ -1302,6 +1357,7 @@ mod tests {
             no_ime: false,
             scale: scale::Scale::default(),
             wheel_zoom: 1.0,
+            wheel_target_ui: None,
         };
         theme::apply(&ctx, ThemeMode::Dark);
         assert_eq!(ctx.global_style().visuals.panel_fill, theme::DARK.panel);
@@ -1346,6 +1402,7 @@ mod tests {
             no_ime: false,
             scale: scale::Scale::default(),
             wheel_zoom: 1.0,
+            wheel_target_ui: None,
         };
         assert_eq!(app.tabs.len(), 1);
 
@@ -1407,6 +1464,7 @@ mod tests {
             no_ime: false,
             scale: scale::Scale::default(),
             wheel_zoom: 1.0,
+            wheel_target_ui: None,
         };
 
         app.on_exit();
