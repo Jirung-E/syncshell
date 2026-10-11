@@ -434,29 +434,10 @@ impl PanelLayout {
 impl SyncShellApp {
     pub fn new(cc: &eframe::CreationContext<'_>, state: syncshell_core::session::State) -> Self {
         let config = syncshell_core::session::load_config();
-        let fallback_dir = std::env::current_dir().unwrap_or_else(|_| {
-            if cfg!(windows) {
-                PathBuf::from("C:\\")
-            } else {
-                PathBuf::from("/")
-            }
-        });
 
-        // DEV-010: 저장된 탭이 있으면 복원한다. 폴더가 그새 지워졌으면(다른
-        // 프로그램이 지웠거나 드라이브가 빠짐) 존재하는 조상까지 조용히 올라가고,
-        // 그마저 없으면 기본 시작 위치로 — 크래시 없이 뭔가는 뜨게 한다.
-        let mut tabs: Vec<Tab> = state
-            .tabs
-            .iter()
-            .map(|t| {
-                let dir = syncshell_core::session::resolve_existing_or_fallback(&t.path, &fallback_dir);
-                Tab::new(&cc.egui_ctx, dir, config.default_shell.as_deref())
-            })
-            .collect();
-        if tabs.is_empty() {
-            tabs.push(Tab::new(&cc.egui_ctx, fallback_dir, config.default_shell.as_deref()));
-        }
-        let active = state.active_tab.min(tabs.len() - 1);
+        // DEV-031: 탭과 탭별 경로는 복원하지 않는다 — 시작은 항상 홈 폴더 탭 하나.
+        let tabs = vec![Tab::new(&cc.egui_ctx, syncshell_core::session::start_dir(), config.default_shell.as_deref())];
+        let active = 0;
 
         let theme = ThemeMode::parse(&state.ui.theme);
         theme::apply(&cc.egui_ctx, theme);
@@ -489,12 +470,6 @@ impl SyncShellApp {
     /// 내용을 파일을 거치지 않고 테스트하기 위해서다.
     fn session_state(&self) -> syncshell_core::session::State {
         syncshell_core::session::State {
-            tabs: self
-                .tabs
-                .iter()
-                .map(|t| syncshell_core::session::TabState { path: t.fs.current_dir.clone() })
-                .collect(),
-            active_tab: self.active,
             window: self.last_window_rect.map(|r| syncshell_core::session::WindowState {
                 x: r.min.x,
                 y: r.min.y,
@@ -1470,15 +1445,13 @@ mod tests {
         app.on_exit();
 
         let saved = syncshell_core::session::load_state();
+        let text = std::fs::read_to_string(test_home.join("state.toml")).unwrap_or_default();
         unsafe {
             std::env::remove_var("SYNCSHELL_HOME");
         }
         std::fs::remove_dir_all(&test_home).ok();
 
-        assert_eq!(saved.tabs.len(), 2);
-        assert_eq!(saved.tabs[0].path, dir_a);
-        assert_eq!(saved.tabs[1].path, dir_b);
-        assert_eq!(saved.active_tab, 1, "활성 탭 인덱스가 저장되지 않음");
+        assert!(!text.contains("tabs"), "탭 목록은 저장하지 않아야 함(DEV-031): {text}");
         let window = saved.window.expect("창 크기/위치가 저장되지 않음");
         assert_eq!(window.width, 1200.0);
         assert_eq!(window.height, 700.0);

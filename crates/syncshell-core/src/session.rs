@@ -1,4 +1,5 @@
-//! 세션(탭/창) 복원과 앱 설정 저장(DEV-010).
+//! 창·표시 상태 복원과 앱 설정 저장(DEV-010). 탭과 탭별 경로는 복원하지
+//! 않는다 — 시작은 항상 홈 폴더 탭 하나(DEV-031).
 //!
 //! ## 저장 위치: `~/.syncshell/` 하나, 세 플랫폼 동일
 //!
@@ -9,7 +10,7 @@
 //! ```text
 //! ~/.syncshell/
 //! ├── config.toml    ← 사람이 만지는 것 (셸, 동기화 기본값)
-//! └── state.toml     ← 앱이 덮어쓰는 것 (탭, 창 위치/크기)
+//! └── state.toml     ← 앱이 덮어쓰는 것 (창 위치/크기, 테마·배율 등 표시 상태)
 //! ```
 //!
 //! 파일을 둘로 나누는 이유는 git 관리가 아니라: 설정은 사람이 쓰고 상태는 앱이
@@ -78,12 +79,11 @@ pub struct Config {
     pub default_shell: Option<String>,
 }
 
-/// 앱이 종료 시 덮어쓰는 상태.
+/// 앱이 종료 시 덮어쓰는 상태. 예전 버전이 남긴 `tabs`·`active_tab`은 모르는
+/// 항목으로 무시되고 다음 저장 때 사라진다(DEV-031).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
 pub struct State {
-    pub tabs: Vec<TabState>,
-    pub active_tab: usize,
     pub window: Option<WindowState>,
     pub ui: UiState,
 }
@@ -105,11 +105,6 @@ pub struct UiState {
     pub ui_scale: Option<f64>,
     /// 터미널 글자 크기(UI 배율 100% 기준 pt). 없으면 기본값 — DEV-026
     pub term_font_size: Option<f64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct TabState {
-    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -174,20 +169,15 @@ pub fn save_state(state: &State) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 세션 복원 시 저장된 경로가 이제 없으면(폴더가 지워졌거나 이동함) 존재하는
-/// 조상 폴더를 찾을 때까지 조용히 상위로 올라간다. 그마저 없으면(드라이브가
-/// 통째로 사라짐 등) `fallback`을 쓴다.
-pub fn resolve_existing_or_fallback(path: &Path, fallback: &Path) -> PathBuf {
-    let mut candidate = path.to_path_buf();
-    loop {
-        if candidate.is_dir() {
-            return candidate;
-        }
-        match candidate.parent() {
-            Some(parent) => candidate = parent.to_path_buf(),
-            None => return fallback.to_path_buf(),
-        }
-    }
+/// 앱을 켤 때 첫 탭이 열릴 폴더(DEV-031): 홈 → 없으면 실행 위치 → 그마저
+/// 없으면 파일시스템 루트.
+pub fn start_dir() -> PathBuf {
+    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(home_var)
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "C:\\" } else { "/" }))
 }
 
 #[cfg(test)]
@@ -267,11 +257,9 @@ mod tests {
     }
 
     #[test]
-    fn state_round_trips_tabs_and_window() {
+    fn state_round_trips_window_and_ui() {
         with_syncshell_home(|_| {
             let state = State {
-                tabs: vec![TabState { path: PathBuf::from("/tmp") }, TabState { path: PathBuf::from("/") }],
-                active_tab: 1,
                 window: Some(WindowState { x: 10.0, y: 20.0, width: 1400.0, height: 800.0 }),
                 ui: UiState {
                     theme: "light".to_string(),
@@ -299,15 +287,23 @@ mod tests {
         });
     }
 
-    /// `[ui]` 섹션이 생기기 전에 저장된 state.toml도 그대로 읽혀야 한다 —
-    /// 업데이트 후 첫 실행에서 탭이 전부 날아가면 안 된다.
+    /// 예전 버전이 남긴 state.toml(`[ui]` 없음, 탭 목록 있음)도 손상으로 취급하지
+    /// 않고 읽혀야 한다 — 창 크기는 살리고 탭 목록은 무시(DEV-031).
     #[test]
-    fn state_without_ui_section_still_loads() {
+    fn old_state_with_tabs_still_loads() {
         with_syncshell_home(|dir| {
-            std::fs::write(dir.join("state.toml"), "active_tab = 0\n\n[[tabs]]\npath = \"/tmp\"\n").unwrap();
+            std::fs::write(
+                dir.join("state.toml"),
+                "active_tab = 0\n\n[[tabs]]\npath = \"/tmp\"\n\n[window]\nx = 1.0\ny = 2.0\nwidth = 900.0\nheight = 600.0\n",
+            )
+            .unwrap();
             let state = load_state();
-            assert_eq!(state.tabs.len(), 1, "예전 형식 state.toml의 탭을 못 읽음");
+            assert!(!dir.join("state.toml.bak").exists(), "예전 형식을 손상으로 취급함");
+            assert_eq!(state.window.map(|w| w.width), Some(900.0), "예전 형식의 창 크기를 못 읽음");
             assert_eq!(state.ui, UiState::default());
+            save_state(&state).unwrap();
+            let text = std::fs::read_to_string(dir.join("state.toml")).unwrap();
+            assert!(!text.contains("tabs"), "다시 저장했는데 탭 목록이 남음: {text}");
         });
     }
 
@@ -333,30 +329,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_existing_or_fallback_walks_up_to_existing_ancestor() {
-        let base = std::env::temp_dir().join(format!("syncshell-resolve-{}", std::process::id()));
-        std::fs::create_dir_all(&base).unwrap();
-        let missing = base.join("deleted_child/deleted_grandchild");
-
-        let resolved = resolve_existing_or_fallback(&missing, Path::new("/"));
-
-        assert_eq!(resolved, base, "존재하지 않는 경로면 존재하는 조상까지 올라가야 함");
-        std::fs::remove_dir_all(&base).ok();
-    }
-
-    /// 절대경로는 결국 파일시스템 루트("/", "C:\" 등)에 닿는데, 루트는 사실상
-    /// 항상 존재해서 실제로는 fallback까지 갈 일이 드물다(그건
-    /// walks_up_to_existing_ancestor 테스트가 이미 확인함). fallback 분기가
-    /// 실제로 타지는 경우는 **상대경로**처럼 절대 루트에 안 닿는 경로 — 유닉스에서
-    /// `Path::parent()`는 "foo" → `Some("")` → `None`으로 끝나고, 빈 경로는
-    /// `is_dir()`가 false라 결국 조상을 못 찾는다.
-    #[test]
-    fn resolve_existing_or_fallback_uses_fallback_when_nothing_exists() {
-        let bogus = PathBuf::from("does/not/exist/anywhere/xyz123");
-        let fallback = std::env::temp_dir();
-
-        let resolved = resolve_existing_or_fallback(&bogus, &fallback);
-
-        assert_eq!(resolved, fallback);
+    fn start_dir_is_existing_home() {
+        let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let dir = start_dir();
+        assert!(dir.is_dir());
+        if let Some(home) = std::env::var_os(home_var).map(PathBuf::from).filter(|p| p.is_dir()) {
+            assert_eq!(dir, home, "홈이 있는데 다른 곳에서 시작함");
+        }
     }
 }
