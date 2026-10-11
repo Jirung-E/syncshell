@@ -53,6 +53,19 @@ impl TerminalWidget {
         self.theme = theme;
     }
 
+    /// 터미널 글자 크기(egui pt, DEV-026). 바뀌면 셀 크기가 달라지므로 폰트 폴백
+    /// 사전 스캔도 다시 돌게 한다.
+    pub fn set_font_size(&mut self, points: f32) {
+        if (self.font_id.size - points).abs() < 0.01 {
+            return;
+        }
+        self.font_id.size = points;
+        if let Some(bold) = &mut self.bold_font_id {
+            bold.size = points;
+        }
+        self.last_scan_key = None;
+    }
+
     /// 사전 스캔을 실제로 돌린 누적 횟수 — 테스트에서 "안 바뀐 프레임은
     /// 건너뛰는지" 확인하는 용도.
     /// 지금 IME로 조합 중인 글자(없으면 빈 문자열).

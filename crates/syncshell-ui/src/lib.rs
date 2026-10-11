@@ -4,6 +4,7 @@ mod file_panel;
 #[cfg(test)]
 mod latency_probe;
 mod profile;
+mod scale;
 mod selftest;
 mod font_fallback;
 mod terminal_widget;
@@ -356,6 +357,11 @@ pub struct SyncShellApp {
     /// 상태일 때만 키 반복이 밀리는지 실제 키보드로 비교하려고 넣었다 — 끄면 한글
     /// 입력은 안 된다.
     no_ime: bool,
+    /// UI 배율과 터미널 글자 크기(DEV-026) — 앱 전역, `state.toml` `[ui]`에 저장.
+    scale: scale::Scale,
+    /// Ctrl/Cmd+휠로 들어온 확대 비율을 모아 두는 곳 — 한 칸(약 10%)이 쌓일 때마다
+    /// 터미널 글자를 1씩 바꾼다(휠 한 번에 글자가 여러 단계 튀지 않게).
+    wheel_zoom: f32,
 }
 
 /// [`Tab::sync_status`] 참고.
@@ -453,6 +459,13 @@ impl SyncShellApp {
         let theme = ThemeMode::parse(&state.ui.theme);
         theme::apply(&cc.egui_ctx, theme);
 
+        // DEV-026: egui 기본 키보드 확대(Ctrl/Cmd + = − 0)는 끈다 — 같은 키를 터미널
+        // 글자 크기에 쓰고, UI 배율은 Shift를 더한 키로 우리가 직접 처리한다.
+        let scale =
+            scale::Scale::from_saved(state.ui.ui_scale.map(|v| v as f32), state.ui.term_font_size.map(|v| v as f32));
+        cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        cc.egui_ctx.set_zoom_factor(scale.ui);
+
         Self {
             tabs,
             active,
@@ -464,6 +477,8 @@ impl SyncShellApp {
             profiler: profile::Profiler::from_env(),
             selftest: selftest::SelfTest::from_env(),
             no_ime: std::env::var("SYNCSHELL_NO_IME").is_ok_and(|v| !v.is_empty() && v != "0"),
+            scale,
+            wheel_zoom: 1.0,
         }
     }
 
@@ -487,7 +502,19 @@ impl SyncShellApp {
                 theme: self.theme.as_str().to_string(),
                 view: self.view_mode.as_str().to_string(),
                 layout: self.panel_layout.as_str().to_string(),
+                // f64로 반올림해 저장한다 — f32 그대로 쓰면 state.toml에
+                // 1.2000000476837158처럼 찍힌다.
+                ui_scale: Some((self.scale.ui as f64 * 100.0).round() / 100.0),
+                term_font_size: Some(self.scale.font.round() as f64),
             },
+        }
+    }
+
+    fn apply_scale(&mut self, ctx: &egui::Context, action: scale::ScaleAction) {
+        let before = self.scale;
+        self.scale.apply(action);
+        if self.scale.ui != before.ui {
+            ctx.set_zoom_factor(self.scale.ui);
         }
     }
 
@@ -797,9 +824,17 @@ fn tab_card(
 }
 
 /// 하단 상태바(DEV-023): 동기화 상태 · 현재 폴더 · 항목 수.
-fn status_bar(ui: &mut egui::Ui, pal: &theme::Palette, tab: &Tab, profile: Option<&str>) {
+/// 하단 상태바. 배율 메뉴에서 고른 동작이 있으면 돌려준다(DEV-026).
+fn status_bar(
+    ui: &mut egui::Ui,
+    pal: &theme::Palette,
+    tab: &Tab,
+    profile: Option<&str>,
+    scale: &scale::Scale,
+) -> Option<scale::ScaleAction> {
     let sync = tab.sync_status();
     let small = egui::FontId::proportional(11.5);
+    let mut picked = None;
     ui.horizontal_centered(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(13.0, 13.0), egui::Sense::hover());
@@ -810,12 +845,15 @@ fn status_bar(ui: &mut egui::Ui, pal: &theme::Palette, tab: &Tab, profile: Optio
         ui.add(egui::Label::new(egui::RichText::new(home_relative(&tab.fs.current_dir)).font(small.clone()).color(pal.muted)).truncate());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(egui::RichText::new(format!("{}개 항목", tab.fs.entries.len())).font(small.clone()).color(pal.muted));
+            ui.add_space(8.0);
+            picked = scale::status_menu(ui, scale, small.clone(), pal.muted);
             if let Some(profile) = profile {
                 ui.add_space(12.0);
                 ui.add(egui::Label::new(egui::RichText::new(profile).font(small).color(pal.accent)).truncate());
             }
         });
     });
+    picked
 }
 
 /// 홈 폴더 아래 경로는 `~/…`로 줄여 보여준다(상태바 폭 절약, 셸 프롬프트와 같은 표기).
@@ -874,6 +912,10 @@ impl eframe::App for SyncShellApp {
         if CUSTOM_WINDOW_CONTROLS {
             handle_edge_resize(ui.ctx(), ui.max_rect());
         }
+        // 배율 단축키는 다른 위젯보다 먼저 꺼내 지운다 — 터미널이 키로 받지 않게.
+        for action in scale::take_shortcuts(ui.ctx()) {
+            self.apply_scale(&ui.ctx().clone(), action);
+        }
         // `default_size`가 아니라 `exact_size`를 써야 한다 — `default_size`는
         // 첫 프레임 초기값 힌트일 뿐 허용 범위를 그대로 열어두고(egui 소스
         // 확인: min/max range가 안 좁혀짐), 이후 프레임에서 내용(탭 한 줄) 쪽으로
@@ -904,7 +946,16 @@ impl eframe::App for SyncShellApp {
             .inner_margin(egui::Margin::symmetric(12, 0))
             .stroke(egui::Stroke::new(1.0, pal.border));
         egui::Panel::bottom("status_bar").exact_size(STATUS_BAR_HEIGHT).frame(status_frame).show(ui, |ui| {
-            status_bar(ui, pal, &self.tabs[self.active], self.profiler.as_ref().map(|p| p.summary.as_str()));
+            let picked = status_bar(
+                ui,
+                pal,
+                &self.tabs[self.active],
+                self.profiler.as_ref().map(|p| p.summary.as_str()),
+                &self.scale,
+            );
+            if let Some(action) = picked {
+                self.apply_scale(&ui.ctx().clone(), action);
+            }
         });
 
         // 활성 탭의 셸이 종료됐으면(예: exit 입력) 탭을 닫는다 — 탭이 하나뿐이면
@@ -919,6 +970,10 @@ impl eframe::App for SyncShellApp {
         }
 
         let theme = self.theme;
+        let terminal_points = self.scale.terminal_points();
+        for tab in &mut self.tabs {
+            tab.terminal_widget.set_font_size(terminal_points);
+        }
         let active = &mut self.tabs[self.active];
         active.terminal_widget.set_theme(theme);
 
@@ -954,6 +1009,26 @@ impl eframe::App for SyncShellApp {
 
         active.handle_dropped_files(ui.ctx(), central.response.rect);
 
+        // 터미널 위에서 Ctrl/Cmd+휠 = 터미널 글자 크기(DEV-026). egui는 Ctrl+휠을
+        // 스크롤 대신 zoom_delta로 넘겨주므로 터미널 스크롤과 겹치지 않는다.
+        let wheel_action = if central.response.contains_pointer() {
+            let z = ui.ctx().input(|i| i.zoom_delta());
+            if z != 1.0 {
+                self.wheel_zoom *= z;
+            }
+            if self.wheel_zoom >= 1.1 {
+                self.wheel_zoom = 1.0;
+                Some(scale::ScaleAction::FontIn)
+            } else if self.wheel_zoom <= 1.0 / 1.1 {
+                self.wheel_zoom = 1.0;
+                Some(scale::ScaleAction::FontOut)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // 이번 프레임에 클릭이 있었으면, 그 위치로 "지금 어느 패널을 쓰고
         // 있는지"를 갱신한다 — 다음 프레임의 복사/붙여넣기 단축키 판단에 쓰인다
         // (한 프레임 지연은 사람이 체감 못 함 — `ActivePanel` 설명 참고).
@@ -967,10 +1042,20 @@ impl eframe::App for SyncShellApp {
             }
         }
 
+        if let Some(wheel_action) = wheel_action {
+            self.apply_scale(&ui.ctx().clone(), wheel_action);
+        }
+
         // DEV-010: on_exit에는 Context가 안 넘어오므로 창 위치/크기를 매 프레임
-        // 여기 캐시해둔다 — 종료 시 이 마지막 값을 state.toml에 쓴다.
+        // 여기 캐시해둔다. egui는 UI 배율(zoom)이 적용된 단위로 알려주므로 배율을
+        // 곱해 OS 논리 단위로 되돌린다 — 안 그러면 배율 150%로 끈 뒤 다시 켤 때
+        // 창이 2/3 크기로 줄어든다(DEV-026).
         if let Some(rect) = ui.ctx().input(|i| i.viewport().outer_rect) {
-            self.last_window_rect = Some(rect);
+            let z = ui.ctx().zoom_factor();
+            self.last_window_rect = Some(egui::Rect::from_min_size(
+                (rect.min.to_vec2() * z).to_pos2(),
+                rect.size() * z,
+            ));
         }
 
         if self.no_ime {
@@ -1107,6 +1192,8 @@ mod tests {
             profiler: None,
             selftest: None,
             no_ime: false,
+            scale: scale::Scale::default(),
+            wheel_zoom: 1.0,
         };
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, TAB_BAR_HEIGHT));
         let mut frame = |events: Vec<egui::Event>| {
@@ -1213,6 +1300,8 @@ mod tests {
             profiler: None,
             selftest: None,
             no_ime: false,
+            scale: scale::Scale::default(),
+            wheel_zoom: 1.0,
         };
         theme::apply(&ctx, ThemeMode::Dark);
         assert_eq!(ctx.global_style().visuals.panel_fill, theme::DARK.panel);
@@ -1227,6 +1316,15 @@ mod tests {
 
         app.panel_layout = PanelLayout::Stacked;
         assert_eq!(app.session_state().ui.layout, "stacked", "종료 시 저장할 상태에 분할 모양이 안 들어감(DEV-023)");
+
+        app.apply_scale(&ctx, scale::ScaleAction::UiIn);
+        app.apply_scale(&ctx, scale::ScaleAction::FontOut);
+        let saved = app.session_state().ui;
+        assert_eq!(saved.ui_scale, Some(1.1), "UI 배율이 저장 상태에 안 들어감(DEV-026)");
+        assert_eq!(saved.term_font_size, Some(15.0), "터미널 글자 크기가 저장 상태에 안 들어감(DEV-026)");
+        // egui는 zoom_factor 변경을 다음 프레임에 반영한다.
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        assert!((ctx.zoom_factor() - 1.1).abs() < 1e-4, "UI 배율을 바꿨는데 egui zoom_factor가 안 바뀜");
     }
 
     /// DEV-009: 탭 추가/전환/닫기의 인덱스 계산이 정확한지 — 실제 `Tab::new`(진짜
@@ -1246,6 +1344,8 @@ mod tests {
             profiler: None,
             selftest: None,
             no_ime: false,
+            scale: scale::Scale::default(),
+            wheel_zoom: 1.0,
         };
         assert_eq!(app.tabs.len(), 1);
 
@@ -1305,6 +1405,8 @@ mod tests {
             profiler: None,
             selftest: None,
             no_ime: false,
+            scale: scale::Scale::default(),
+            wheel_zoom: 1.0,
         };
 
         app.on_exit();

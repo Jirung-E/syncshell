@@ -101,6 +101,10 @@ pub struct UiState {
     pub view: String,
     /// 탐색기·터미널 분할 "side" | "stacked"
     pub layout: String,
+    /// UI 배율(1.0 = 100%). 없으면 기본값 — DEV-026
+    pub ui_scale: Option<f64>,
+    /// 터미널 글자 크기(UI 배율 100% 기준 pt). 없으면 기본값 — DEV-026
+    pub term_font_size: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -269,7 +273,13 @@ mod tests {
                 tabs: vec![TabState { path: PathBuf::from("/tmp") }, TabState { path: PathBuf::from("/") }],
                 active_tab: 1,
                 window: Some(WindowState { x: 10.0, y: 20.0, width: 1400.0, height: 800.0 }),
-                ui: UiState { theme: "light".to_string(), view: "icons".to_string(), layout: "stacked".to_string() },
+                ui: UiState {
+                    theme: "light".to_string(),
+                    view: "icons".to_string(),
+                    layout: "stacked".to_string(),
+                    ui_scale: Some(1.2),
+                    term_font_size: Some(14.0),
+                },
             };
             save_state(&state).unwrap();
 
