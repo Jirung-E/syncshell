@@ -466,6 +466,13 @@ impl SyncShellApp {
         }
     }
 
+    /// 현재 탭 경로를 클립보드로 복사하고 상태바에 "복사됨"을 잠깐 띄운다(DEV-027).
+    fn copy_current_path(&mut self, ctx: &egui::Context) {
+        ctx.copy_text(self.tabs[self.active].fs.current_dir.display().to_string());
+        let now = ctx.input(|i| i.time);
+        ctx.data_mut(|d| d.insert_temp(path_copied_id(), now));
+    }
+
     /// 종료 시 `state.toml`에 쓸 내용(DEV-010). `on_exit`과 분리해둔 건 저장
     /// 내용을 파일을 거치지 않고 테스트하기 위해서다.
     fn session_state(&self) -> syncshell_core::session::State {
@@ -830,18 +837,27 @@ fn tab_card(
     TabCardOutput { clicked: resp.clicked(), close_clicked }
 }
 
+/// 상태바에서 사용자가 고른 동작.
+#[derive(Default)]
+struct StatusBarPick {
+    /// 배율 메뉴(DEV-026)
+    scale: Option<scale::ScaleAction>,
+    /// 경로를 눌러 복사(DEV-027)
+    copy_path: bool,
+}
+
+/// "경로 복사됨" 표시를 띄워 두는 시간(초).
+const PATH_COPIED_SECS: f64 = 1.5;
+
+fn path_copied_id() -> egui::Id {
+    egui::Id::new("status_path_copied_at")
+}
+
 /// 하단 상태바(DEV-023): 동기화 상태 · 현재 폴더 · 항목 수.
-/// 하단 상태바. 배율 메뉴에서 고른 동작이 있으면 돌려준다(DEV-026).
-fn status_bar(
-    ui: &mut egui::Ui,
-    pal: &theme::Palette,
-    tab: &Tab,
-    profile: Option<&str>,
-    scale: &scale::Scale,
-) -> Option<scale::ScaleAction> {
+fn status_bar(ui: &mut egui::Ui, pal: &theme::Palette, tab: &Tab, profile: Option<&str>, scale: &scale::Scale) -> StatusBarPick {
     let sync = tab.sync_status();
     let small = egui::FontId::proportional(11.5);
-    let mut picked = None;
+    let mut picked = StatusBarPick::default();
     ui.horizontal_centered(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(13.0, 13.0), egui::Sense::hover());
@@ -849,11 +865,26 @@ fn status_bar(
         chrome::paint_icon(ui.painter(), icon_rect, chrome::Icon::Link, icon_color);
         ui.label(egui::RichText::new(sync.label()).font(small.clone()).color(pal.text));
         ui.add_space(8.0);
-        ui.add(egui::Label::new(egui::RichText::new(home_relative(&tab.fs.current_dir)).font(small.clone()).color(pal.muted)).truncate());
+        // DEV-027: 경로를 누르면 전체 경로를 복사한다.
+        let path = ui
+            .add(
+                egui::Label::new(egui::RichText::new(home_relative(&tab.fs.current_dir)).font(small.clone()).color(pal.muted))
+                    .truncate()
+                    .sense(egui::Sense::click()),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(format!("{}\n클릭해서 경로 복사 ({})", tab.fs.current_dir.display(), copy_path_shortcut_label()));
+        picked.copy_path = path.clicked();
+        let now = ui.input(|i| i.time);
+        let copied_at = ui.data(|d| d.get_temp::<f64>(path_copied_id()));
+        if let Some(at) = copied_at.filter(|at| now - at < PATH_COPIED_SECS) {
+            ui.label(egui::RichText::new("복사됨").font(small.clone()).color(pal.accent));
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(PATH_COPIED_SECS - (now - at)));
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(egui::RichText::new(format!("{}개 항목", tab.fs.entries.len())).font(small.clone()).color(pal.muted));
             ui.add_space(8.0);
-            picked = scale::status_menu(ui, scale, small.clone(), pal.muted);
+            picked.scale = scale::status_menu(ui, scale, small.clone(), pal.muted);
             if let Some(profile) = profile {
                 ui.add_space(12.0);
                 ui.add(egui::Label::new(egui::RichText::new(profile).font(small).color(pal.accent)).truncate());
@@ -861,6 +892,60 @@ fn status_bar(
         });
     });
     picked
+}
+
+/// 현재 경로 복사 단축키 표기(DEV-027). VS Code "경로 복사"와 같은 키.
+fn copy_path_shortcut_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Cmd+Option+C"
+    } else {
+        "Shift+Alt+C"
+    }
+}
+
+/// 현재 경로 복사 단축키(DEV-027): macOS Cmd+Option+C, 그 외 Shift+Alt+C.
+/// 다른 위젯보다 먼저 꺼내 지운다 — 터미널이 키로 받지 않게. Windows는 Alt 조합에도
+/// 글자(Text) 이벤트가 따라올 수 있어 바로 뒤의 Text도 함께 지운다. macOS에서는
+/// egui-winit이 Cmd+(Option+)C를 Key가 아니라 `Copy` 이벤트로 바꿔 보내므로, 그때의
+/// 수식키 상태로 가린다(그냥 Cmd+C는 터미널 복사로 그대로 둔다).
+fn take_copy_path_shortcut(ctx: &egui::Context) -> bool {
+    let mut hit = false;
+    ctx.input_mut(|i| {
+        let held = i.modifiers;
+        let mut drop_text = false;
+        i.events.retain(|e| match e {
+            egui::Event::Copy if held.alt && is_copy_path_modifiers(held) => {
+                hit = true;
+                false
+            }
+            egui::Event::Key { key, physical_key, pressed, modifiers, .. }
+                if physical_key.unwrap_or(*key) == egui::Key::C && modifiers.alt && is_copy_path_modifiers(*modifiers) =>
+            {
+                if *pressed {
+                    hit = true;
+                }
+                drop_text = *pressed;
+                false
+            }
+            egui::Event::Text(_) if drop_text => {
+                drop_text = false;
+                false
+            }
+            _ => {
+                drop_text = false;
+                true
+            }
+        });
+    });
+    hit
+}
+
+fn is_copy_path_modifiers(m: egui::Modifiers) -> bool {
+    if cfg!(target_os = "macos") {
+        m.mac_cmd && !m.shift && !m.ctrl
+    } else {
+        m.shift && !m.ctrl
+    }
 }
 
 /// 홈 폴더 아래 경로는 `~/…`로 줄여 보여준다(상태바 폭 절약, 셸 프롬프트와 같은 표기).
@@ -923,6 +1008,9 @@ impl eframe::App for SyncShellApp {
         for action in scale::take_shortcuts(ui.ctx()) {
             self.apply_scale(&ui.ctx().clone(), action);
         }
+        if take_copy_path_shortcut(ui.ctx()) {
+            self.copy_current_path(ui.ctx());
+        }
         // `default_size`가 아니라 `exact_size`를 써야 한다 — `default_size`는
         // 첫 프레임 초기값 힌트일 뿐 허용 범위를 그대로 열어두고(egui 소스
         // 확인: min/max range가 안 좁혀짐), 이후 프레임에서 내용(탭 한 줄) 쪽으로
@@ -960,8 +1048,11 @@ impl eframe::App for SyncShellApp {
                 self.profiler.as_ref().map(|p| p.summary.as_str()),
                 &self.scale,
             );
-            if let Some(action) = picked {
+            if let Some(action) = picked.scale {
                 self.apply_scale(&ui.ctx().clone(), action);
+            }
+            if picked.copy_path {
+                self.copy_current_path(ui.ctx());
             }
         });
 
@@ -1273,6 +1364,49 @@ mod tests {
 
     /// DEV-026: Ctrl/Cmd+휠 — 터미널 위는 글자, 밖이나 Shift면 UI 배율. 작은 휠
     /// 움직임은 모았다가 한 칸이 되면 한 단계, 대상이 바뀌면 모은 양을 버린다.
+    /// DEV-027: 경로 복사 단축키를 꺼내고(남은 이벤트 없음 — 터미널에 글자가 안 감),
+    /// 그냥 Cmd/Ctrl+C(터미널 복사)는 건드리지 않는다.
+    #[test]
+    fn copy_path_shortcut_is_taken_and_plain_copy_is_left_alone() {
+        let run = |modifiers: egui::Modifiers, events: Vec<egui::Event>| {
+            let ctx = egui::Context::default();
+            let mut input = egui::RawInput::default();
+            input.modifiers = modifiers;
+            input.events = events;
+            let mut result = (false, 0);
+            let _ = ctx.run_ui(input, |ui| {
+                let hit = take_copy_path_shortcut(ui.ctx());
+                result = (hit, ui.input(|i| i.events.len()));
+            });
+            result
+        };
+        let key = |modifiers: egui::Modifiers| egui::Event::Key {
+            key: egui::Key::C,
+            physical_key: Some(egui::Key::C),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+
+        let mac_mods = egui::Modifiers { alt: true, mac_cmd: true, command: true, ..Default::default() };
+        let win_mods = egui::Modifiers { alt: true, shift: true, ..Default::default() };
+        let (shortcut, plain) = if cfg!(target_os = "macos") {
+            // egui-winit은 Cmd+Option+C를 Copy 이벤트로 바꿔 보낸다
+            ((mac_mods, vec![egui::Event::Copy]), (egui::Modifiers::COMMAND, vec![egui::Event::Copy]))
+        } else {
+            // Alt 조합에 따라오는 글자 이벤트까지 지워야 한다
+            (
+                (win_mods, vec![key(win_mods), egui::Event::Text("C".into())]),
+                (egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, vec![egui::Event::Copy]),
+            )
+        };
+        assert_eq!(run(shortcut.0, shortcut.1), (true, 0), "경로 복사 단축키를 못 잡거나 이벤트가 남음");
+        assert_eq!(run(plain.0, plain.1), (false, 1), "터미널 복사(Cmd/Ctrl+C)를 가로챔");
+        // Alt 없이 C만 → 그대로
+        let c = egui::Modifiers::NONE;
+        assert_eq!(run(c, vec![key(c), egui::Event::Text("c".into())]), (false, 2));
+    }
+
     #[test]
     fn ctrl_wheel_targets_font_over_terminal_and_ui_elsewhere() {
         use scale::ScaleAction::*;
