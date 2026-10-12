@@ -3,6 +3,7 @@ mod chrome;
 mod file_panel;
 #[cfg(test)]
 mod latency_probe;
+mod preview;
 mod profile;
 mod scale;
 mod selftest;
@@ -351,6 +352,8 @@ pub struct SyncShellApp {
     /// 탐색기 트리/아이콘 보기(DEV-022). 탭마다 다르면 탭을 옮길 때마다 모양이
     /// 바뀌어 헷갈려서 앱 전역 하나 — `state.toml`의 `[ui] view`로 저장된다.
     view_mode: ViewMode,
+    /// 탐색기 안 미리보기 칸(DEV-029). 앱 전역 — `state.toml`의 `[ui] preview_pane`.
+    preview_pane: bool,
     /// `SYNCSHELL_PROFILE=1`일 때만 켜지는 성능 진단(BUG-006).
     profiler: Option<profile::Profiler>,
     /// `SYNCSHELL_SELFTEST=keys`일 때만 켜지는 실제 창 자가 진단(BUG-006).
@@ -461,6 +464,7 @@ impl SyncShellApp {
             panel_layout: PanelLayout::parse(&state.ui.layout),
             theme,
             view_mode: ViewMode::parse(&state.ui.view),
+            preview_pane: state.ui.preview_pane,
             profiler: profile::Profiler::from_env(),
             selftest: selftest::SelfTest::from_env(),
             no_ime: std::env::var("SYNCSHELL_NO_IME").is_ok_and(|v| !v.is_empty() && v != "0"),
@@ -496,6 +500,7 @@ impl SyncShellApp {
                 // 1.2000000476837158처럼 찍힌다.
                 ui_scale: Some((self.scale.ui as f64 * 100.0).round() / 100.0),
                 term_font_size: Some(self.scale.font.round() as f64),
+                preview_pane: self.preview_pane,
             },
         }
     }
@@ -966,6 +971,15 @@ fn take_copy_path_shortcut(ctx: &egui::Context) -> bool {
     hit
 }
 
+/// 터미널에 들어가는 타이핑인지 — 글자·IME 확정·붙여넣기, 또는 Ctrl/Cmd 없이 누른 키.
+fn is_terminal_typing(e: &egui::Event) -> bool {
+    match e {
+        egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Ime(egui::ImeEvent::Commit(_)) => true,
+        egui::Event::Key { pressed: true, modifiers, .. } => !modifiers.command && !modifiers.ctrl,
+        _ => false,
+    }
+}
+
 fn is_copy_path_modifiers(m: egui::Modifiers) -> bool {
     if cfg!(target_os = "macos") {
         m.mac_cmd && !m.shift && !m.ctrl
@@ -1108,9 +1122,17 @@ impl eframe::App for SyncShellApp {
             // 바뀌었으면 다시 가져온다.
             active.panel.view_mode = self.view_mode;
             active.panel.favorites.clone_from(&self.favorites);
+            active.panel.preview_pane = self.preview_pane;
             action = file_panel::show(ui, &active.fs, &mut active.panel, panel_active);
             self.view_mode = active.panel.view_mode;
+            self.preview_pane = active.panel.preview_pane;
         });
+        // 탐색기가 가져가지 않은 타이핑이 남았으면 사용자는 터미널에 입력하는 중이다
+        // (터미널은 클릭 없이도 키를 받는다). 그럼 터미널을 쓰는 중으로 본다 — 안 그러면
+        // 파일을 클릭한 뒤 터미널에 명령을 치다가 누른 Space가 훑어보기(DEV-029)를 연다.
+        if ui.ctx().input(|i| i.events.iter().any(is_terminal_typing)) {
+            active.active_panel = ActivePanel::Terminal;
+        }
         if let Some(action) = action {
             match action {
                 FileAction::AddFavorite(_) | FileAction::RemoveFavorite(_) => {
@@ -1311,6 +1333,7 @@ mod tests {
             panel_layout: PanelLayout::default(),
             theme: ThemeMode::Dark,
             view_mode: ViewMode::Tree,
+            preview_pane: false,
             profiler: None,
             selftest: None,
             no_ime: false,
@@ -1400,6 +1423,18 @@ mod tests {
 
     /// DEV-026: Ctrl/Cmd+휠 — 터미널 위는 글자, 밖이나 Shift면 UI 배율. 작은 휠
     /// 움직임은 모았다가 한 칸이 되면 한 단계, 대상이 바뀌면 모은 양을 버린다.
+    /// DEV-029: 글자·일반 키는 터미널 타이핑, Ctrl/Cmd 조합(앱·탐색기 단축키)과 포인터는 아님.
+    #[test]
+    fn terminal_typing_is_text_or_plain_key() {
+        let key = |modifiers| egui::Event::Key { key: egui::Key::L, physical_key: None, pressed: true, repeat: false, modifiers };
+        assert!(is_terminal_typing(&egui::Event::Text("l".into())));
+        assert!(is_terminal_typing(&key(egui::Modifiers::NONE)));
+        assert!(is_terminal_typing(&key(egui::Modifiers::SHIFT)));
+        assert!(!is_terminal_typing(&key(egui::Modifiers::COMMAND)));
+        assert!(!is_terminal_typing(&key(egui::Modifiers::CTRL)));
+        assert!(!is_terminal_typing(&egui::Event::PointerMoved(egui::Pos2::ZERO)));
+    }
+
     /// DEV-027: 경로 복사 단축키를 꺼내고(남은 이벤트 없음 — 터미널에 글자가 안 감),
     /// 그냥 Cmd/Ctrl+C(터미널 복사)는 건드리지 않는다.
     #[test]
@@ -1455,6 +1490,7 @@ mod tests {
             panel_layout: PanelLayout::default(),
             theme: ThemeMode::Dark,
             view_mode: ViewMode::Tree,
+            preview_pane: false,
             profiler: None,
             selftest: None,
             no_ime: false,
@@ -1498,6 +1534,7 @@ mod tests {
             panel_layout: PanelLayout::default(),
             theme: ThemeMode::Dark,
             view_mode: ViewMode::Tree,
+            preview_pane: false,
             profiler: None,
             selftest: None,
             no_ime: false,
@@ -1544,6 +1581,7 @@ mod tests {
             panel_layout: PanelLayout::default(),
             theme: ThemeMode::default(),
             view_mode: ViewMode::Tree,
+            preview_pane: false,
             profiler: None,
             selftest: None,
             no_ime: false,
@@ -1607,6 +1645,7 @@ mod tests {
             panel_layout: PanelLayout::default(),
             theme: ThemeMode::default(),
             view_mode: ViewMode::Tree,
+            preview_pane: false,
             profiler: None,
             selftest: None,
             no_ime: false,

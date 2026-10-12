@@ -34,6 +34,8 @@ pub enum Icon {
     /// 즐겨찾기(DEV-028) — 빈 별 / 채운 별
     Star,
     StarFilled,
+    /// 미리보기 칸(DEV-029) — 눈
+    Eye,
 }
 
 /// `rect` 안에 아이콘을 그린다. 좌표는 16×16 격자 기준으로 잡고 rect 크기에
@@ -121,6 +123,16 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             } else {
                 poly(&[(1.5, 7.0), (14.5, 7.0)], false);
             }
+        }
+        Icon::Eye => {
+            poly(
+                &[
+                    (1.5, 8.0), (3.5, 5.6), (6.0, 4.3), (8.0, 4.0), (10.0, 4.3), (12.5, 5.6), (14.5, 8.0),
+                    (12.5, 10.4), (10.0, 11.7), (8.0, 12.0), (6.0, 11.7), (3.5, 10.4),
+                ],
+                true,
+            );
+            painter.circle_stroke(p(8.0, 8.0), 2.2 * s, stroke);
         }
         Icon::Link => {
             // 비스듬한 고리 두 개 — 둥근 사각형 두 개를 45° 돌리는 대신, 시안의

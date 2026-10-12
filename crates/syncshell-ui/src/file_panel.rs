@@ -84,6 +84,12 @@ pub struct FilePanelState {
     /// 즐겨찾기 폴더(DEV-028). `view_mode`처럼 앱 전역 값을 호출부가 매 프레임
     /// 넣어준다 — 추가·제거는 `FileAction`으로 앱에 돌려보낸다.
     pub favorites: Vec<PathBuf>,
+    /// 파일 미리보기(DEV-029) — 읽어 둔 내용과 훑어보기 창 상태.
+    pub preview: crate::preview::PreviewState,
+    /// 탐색기 안 미리보기 칸을 켤지. `view_mode`처럼 앱 전역 값을 호출부가 넣어준다.
+    pub preview_pane: bool,
+    /// 훑어보기 창에서 ↑↓로 선택을 옮겼으면 다음 그리기 때 목록을 그 항목으로 스크롤한다.
+    scroll_to_selected: bool,
 }
 
 /// [`FilePanelState::view_mode`] 참고.
@@ -133,6 +139,9 @@ impl Default for FilePanelState {
             tree_for: None,
             view_mode: ViewMode::Tree,
             favorites: Vec::new(),
+            preview: Default::default(),
+            preview_pane: false,
+            scroll_to_selected: false,
         }
     }
 }
@@ -174,6 +183,24 @@ impl FilePanelState {
 pub fn show(ui: &mut egui::Ui, fs: &FsView, state: &mut FilePanelState, panel_active: bool) -> Option<FileAction> {
     let mut action: Option<FileAction> = None;
     drain_tree_loads(state);
+    let ctx = ui.ctx().clone();
+
+    // 훑어보기 창(DEV-029). 떠 있는 동안은 키 입력을 전부 여기서 가져간다(터미널로
+    // 안 가게). 여는 Space는 탐색기를 쓰는 중이고 파일이 선택돼 있을 때만 가져간다.
+    if state.preview.quick_look {
+        let (close, step) = crate::preview::take_quick_look_keys(&ctx);
+        if step != 0 {
+            step_selection(fs, state, step);
+        }
+        if close {
+            state.preview.quick_look = false;
+        }
+    } else if panel_active && state.rename.is_none() && state.selected.is_some() && crate::preview::take_space(&ctx) {
+        state.preview.quick_look = true;
+        if let Some(sel) = &state.selected {
+            state.preview.request(&ctx, sel, true);
+        }
+    }
 
     if panel_active {
         // macOS는 Cmd+C/Cmd+V — 터미널은 Ctrl+C만 쓰므로(Cmd와는 다른 보조키라
@@ -209,7 +236,8 @@ pub fn show(ui: &mut egui::Ui, fs: &FsView, state: &mut FilePanelState, panel_ac
     ui.horizontal(|ui| {
         const SEGMENT_W: f32 = 2.0 * 28.0 + 4.0;
         const STAR_W: f32 = 26.0;
-        let box_w = (ui.available_width() - SEGMENT_W - STAR_W - 2.0 * ui.spacing().item_spacing.x).max(40.0);
+        const EYE_W: f32 = 26.0;
+        let box_w = (ui.available_width() - SEGMENT_W - STAR_W - EYE_W - 3.0 * ui.spacing().item_spacing.x).max(40.0);
         let is_fav = state.favorites.contains(&fs.current_dir);
         ui.allocate_ui_with_layout(vec2(box_w, 28.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
             egui::Frame::NONE
@@ -243,6 +271,22 @@ pub fn show(ui: &mut egui::Ui, fs: &FsView, state: &mut FilePanelState, panel_ac
             } else {
                 FileAction::AddFavorite(fs.current_dir.clone())
             });
+        }
+        // 탐색기 안 미리보기 칸 켜고 끄기(DEV-029).
+        let tip = if state.preview_pane { "미리보기 칸 숨기기" } else { "미리보기 칸 보이기 (Space: 훑어보기)" };
+        let (eye_rect, eye_resp) = ui.allocate_exact_size(vec2(EYE_W, 26.0), egui::Sense::click());
+        let eye_resp = eye_resp.on_hover_text(tip);
+        #[cfg(test)]
+        tests::record_eye_rect_for_test(eye_rect);
+        if state.preview_pane {
+            ui.painter().rect_filled(eye_rect, 5.0, pal.segment_on);
+        } else if eye_resp.hovered() {
+            ui.painter().rect_filled(eye_rect, 5.0, pal.hover);
+        }
+        let eye_color = if state.preview_pane { pal.accent } else if eye_resp.hovered() { pal.text } else { pal.muted };
+        chrome::paint_icon(ui.painter(), egui::Rect::from_center_size(eye_rect.center(), vec2(16.0, 16.0)), Icon::Eye, eye_color);
+        if eye_resp.clicked() {
+            state.preview_pane = !state.preview_pane;
         }
         // 트리/아이콘 전환. 글리프 대신 painter로 그린 아이콘이라 폰트에 없는
         // 기호가 두부로 나올 걱정이 없다(chrome.rs 참고).
@@ -288,11 +332,53 @@ pub fn show(ui: &mut egui::Ui, fs: &FsView, state: &mut FilePanelState, panel_ac
 
     reset_tree_if_moved(state, &fs.current_dir);
 
+    if state.selected.is_none() {
+        state.preview.quick_look = false;
+    }
+    if state.preview_pane || state.preview.quick_look {
+        if let Some(sel) = state.selected.clone() {
+            state.preview.request(&ctx, &sel, false);
+        }
+    }
+    state.preview.poll(&ctx);
+
+    if state.preview_pane {
+        let area = ui.available_rect_before_wrap();
+        let (list_rect, sep, pv_rect) = crate::preview::split_pane(area, state.preview.pane_frac);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(list_rect), |ui| list_area(ui, fs, state, &mut action));
+        crate::preview::pane_divider(ui, pal, area, sep, &mut state.preview);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(pv_rect), |ui| {
+            #[cfg(test)]
+            tests::record_pane_rect_for_test(pv_rect);
+            crate::preview::body(ui, pal, &state.preview, state.selected.as_deref());
+        });
+        ui.advance_cursor_after_rect(area);
+    } else {
+        list_area(ui, fs, state, &mut action);
+    }
+
+    if let Some(picked) = rename_dialog(ui.ctx(), state) {
+        action = Some(picked);
+    }
+
+    if state.preview.quick_look {
+        if let Some(sel) = state.selected.clone() {
+            if crate::preview::quick_look_window(&ctx, pal, &state.preview, &sel) {
+                state.preview.quick_look = false;
+            }
+        }
+    }
+
+    action
+}
+
+/// ".."·오류 줄과 항목 목록(트리/아이콘).
+fn list_area(ui: &mut egui::Ui, fs: &FsView, state: &mut FilePanelState, action: &mut Option<FileAction>) {
     // ".."과 오류 표시는 목록(entries) 밖 고정 영역에 둔다 — 아래 스크롤 영역이
     // `show_rows`로 가상 스크롤되므로, 스크롤 대상이 아닌 것들은 여기서 미리 그린다.
     if let Some(parent) = fs.current_dir.parent() {
         if ui.selectable_label(false, "..").clicked() {
-            action = Some(FileAction::Navigate(parent.to_path_buf()));
+            *action = Some(FileAction::Navigate(parent.to_path_buf()));
         }
     }
     if let Some(err) = &fs.error {
@@ -300,15 +386,50 @@ pub fn show(ui: &mut egui::Ui, fs: &FsView, state: &mut FilePanelState, panel_ac
     }
 
     match state.view_mode {
-        ViewMode::Tree => tree_view(ui, fs, state, &mut action),
-        ViewMode::Icons => icon_view(ui, fs, state, &mut action),
+        ViewMode::Tree => tree_view(ui, fs, state, action),
+        ViewMode::Icons => icon_view(ui, fs, state, action),
     }
+}
 
-    if let Some(picked) = rename_dialog(ui.ctx(), state) {
-        action = Some(picked);
+/// 지금 목록에 보이는 순서대로의 파일(폴더 제외) — 훑어보기 창의 ↑↓ 이동 순서.
+/// 트리 보기는 그 자리에 펼친 하위 항목도 포함한다.
+fn visible_files(fs: &FsView, state: &FilePanelState) -> Vec<PathBuf> {
+    let entries: Vec<&DirEntry> = match state.view_mode {
+        ViewMode::Icons => fs.entries.iter().collect(),
+        ViewMode::Tree => {
+            let (rows, parents) = flatten_tree(fs, state);
+            rows.iter()
+                .filter_map(|row| match *row {
+                    TreeRow::Top(i) => fs.entries.get(i),
+                    TreeRow::Child { parent, idx, .. } => match state.tree_children.get(&parents[parent]) {
+                        Some(TreeChildren::Loaded(children)) => children.get(idx),
+                        _ => None,
+                    },
+                    TreeRow::Loading { .. } => None,
+                })
+                .collect()
+        }
+    };
+    entries.into_iter().filter(|e| !e.is_dir).map(|e| e.path.clone()).collect()
+}
+
+/// 선택을 보이는 순서상 `step`칸 옮긴다(끝에서 멈춤). 선택이 목록에 없으면 첫 파일.
+fn step_selection(fs: &FsView, state: &mut FilePanelState, step: i32) {
+    let files = visible_files(fs, state);
+    if files.is_empty() {
+        return;
     }
+    let next = match state.selected.as_ref().and_then(|s| files.iter().position(|f| f == s)) {
+        Some(i) => (i as i32 + step).clamp(0, files.len() as i32 - 1) as usize,
+        None => 0,
+    };
+    state.selected = Some(files[next].clone());
+    state.scroll_to_selected = true;
+}
 
-    action
+/// 선택된 항목이 `index`번째 줄에 있을 때, 그 줄이 보이도록 할 스크롤 위치(가운데쯤).
+fn scroll_offset_for_row(index: usize, row_height: f32, viewport: f32) -> f32 {
+    (index as f32 * row_height - (viewport - row_height) / 2.0).max(0.0)
 }
 
 /// 항목(파일/폴더) 하나의 클릭 반응 — 목록 뷰·아이콘 뷰가 모양만 다르고 클릭
@@ -416,13 +537,28 @@ fn tree_view(ui: &mut egui::Ui, fs: &FsView, state: &mut FilePanelState, action:
     painter.hline(head.x_range(), head.bottom(), egui::Stroke::new(1.0, pal.border));
 
     let (rows, parents) = flatten_tree(fs, state);
+    let scroll_to = std::mem::take(&mut state.scroll_to_selected)
+        .then(|| {
+            let sel = state.selected.as_deref()?;
+            rows.iter().position(|row| match *row {
+                TreeRow::Top(i) => fs.entries[i].path == sel,
+                TreeRow::Child { parent, idx, .. } => matches!(
+                    state.tree_children.get(&parents[parent]),
+                    Some(TreeChildren::Loaded(c)) if c.get(idx).is_some_and(|e| e.path == sel)
+                ),
+                TreeRow::Loading { .. } => false,
+            })
+        })
+        .flatten()
+        .map(|i| scroll_offset_for_row(i, TREE_ROW_HEIGHT, ui.available_height()));
     ui.scope(|ui| {
         // 줄 사이 틈 없이 붙인다 — 선택/호버 바탕이 줄 단위로 이어져 보이게.
         ui.spacing_mut().item_spacing.y = 0.0;
-        egui::ScrollArea::vertical()
-            .id_salt("file_list_scroll")
-            .auto_shrink([false, false])
-            .show_rows(ui, TREE_ROW_HEIGHT, rows.len(), |ui, row_range| {
+        let mut area = egui::ScrollArea::vertical().id_salt("file_list_scroll").auto_shrink([false, false]);
+        if let Some(y) = scroll_to {
+            area = area.vertical_scroll_offset(y);
+        }
+        area.show_rows(ui, TREE_ROW_HEIGHT, rows.len(), |ui, row_range| {
                 for row in &rows[row_range] {
                     let (entry, depth) = match *row {
                         TreeRow::Top(i) => (fs.entries[i].clone(), 0),
@@ -556,11 +692,16 @@ fn icon_view(ui: &mut egui::Ui, fs: &FsView, state: &mut FilePanelState, action:
     let width = ui.available_width() - ui.spacing().scroll.allocated_width();
     let cols = icon_columns(width, CELL_SIZE.x, ui.spacing().item_spacing.x);
     let row_count = fs.entries.len().div_ceil(cols);
+    let scroll_to = std::mem::take(&mut state.scroll_to_selected)
+        .then(|| fs.entries.iter().position(|e| Some(e.path.as_path()) == state.selected.as_deref()))
+        .flatten()
+        .map(|i| scroll_offset_for_row(i / cols, CELL_SIZE.y + ui.spacing().item_spacing.y, ui.available_height()));
 
-    egui::ScrollArea::vertical()
-        .id_salt("file_icon_scroll")
-        .auto_shrink([false, false])
-        .show_rows(ui, CELL_SIZE.y, row_count, |ui, row_range| {
+    let mut area = egui::ScrollArea::vertical().id_salt("file_icon_scroll").auto_shrink([false, false]);
+    if let Some(y) = scroll_to {
+        area = area.vertical_scroll_offset(y);
+    }
+    area.show_rows(ui, CELL_SIZE.y, row_count, |ui, row_range| {
             for row in row_range {
                 ui.horizontal(|ui| {
                     for col in 0..cols {
@@ -730,7 +871,7 @@ fn reset_tree_if_moved(state: &mut FilePanelState, current_dir: &Path) {
 
 /// 바이트 수를 사람이 읽는 크기 문자열로. 1024 기준(KiB/MiB/...)이지만 표기는
 /// 익숙한 KB/MB로 — 탐색기 사용자에게 "KiB"는 불필요한 낯섦이다.
-fn format_size(bytes: u64) -> String {
+pub(crate) fn format_size(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
     if bytes == 0 {
         return "0 B".to_string();
@@ -751,7 +892,7 @@ fn format_size(bytes: u64) -> String {
 /// 수정 시각을 로컬 시간 "YYYY-MM-DD HH:MM"로. 못 읽거나(권한 등) 시계가 UNIX
 /// 이전으로 나오는 등 이상값이면 빈 문자열 — 컬럼이 깨진 문자열로 지저분해지는
 /// 것보다 비어 보이는 쪽이 낫다.
-fn format_modified(t: std::time::SystemTime) -> String {
+pub(crate) fn format_modified(t: std::time::SystemTime) -> String {
     chrono::DateTime::<chrono::Local>::from(t)
         .format("%Y-%m-%d %H:%M")
         .to_string()
@@ -1231,6 +1372,92 @@ mod tests {
 
     pub(super) fn record_star_rect_for_test(rect: egui::Rect) {
         STAR_RECT.with(|c| c.set(Some(rect)));
+    }
+
+    thread_local! {
+        static EYE_RECT: std::cell::Cell<Option<egui::Rect>> = const { std::cell::Cell::new(None) };
+        static PANE_RECT: std::cell::Cell<Option<egui::Rect>> = const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn record_eye_rect_for_test(rect: egui::Rect) {
+        EYE_RECT.with(|c| c.set(Some(rect)));
+    }
+
+    pub(super) fn record_pane_rect_for_test(rect: egui::Rect) {
+        PANE_RECT.with(|c| c.set(Some(rect)));
+    }
+
+    /// 미리보기 배경 읽기가 끝날 때까지 프레임을 돌린다.
+    fn frames_until_preview(ctx: &egui::Context, fs: &FsView, state: &mut FilePanelState, want: &Path) {
+        for _ in 0..200 {
+            frame(ctx, fs, state);
+            if state.preview.shown_content().is_some() && !state.preview.is_pending() && state.preview.shown_path() == Some(want) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("미리보기를 다 읽지 못함: {}", want.display());
+    }
+
+    /// DEV-029 C: 파일을 고르고 Space → 훑어보기 창, ↓로 다음 파일, Esc로 닫힘.
+    /// 탐색기를 쓰는 중이 아니면 Space는 터미널 몫이다.
+    #[test]
+    fn space_opens_quick_look_arrows_step_and_escape_closes() {
+        let base = temp_dir_with("quick-look", &["a.txt", "b.txt", "sub/"]);
+        let fs = settled_view(&base);
+        let ctx = egui::Context::default();
+        let mut state = FilePanelState { selected: Some(base.join("a.txt")), ..Default::default() };
+
+        send_key_with_modifiers(&ctx, &fs, &mut state, egui::Key::Space, egui::Modifiers::NONE, false);
+        assert!(!state.preview.quick_look, "터미널을 쓰는 중인데 Space로 창이 열림");
+
+        crate::preview::tests::take_quick_look_rect();
+        send_key_with_modifiers(&ctx, &fs, &mut state, egui::Key::Space, egui::Modifiers::NONE, true);
+        assert!(state.preview.quick_look, "Space로 훑어보기 창이 안 열림");
+        frames_until_preview(&ctx, &fs, &mut state, &base.join("a.txt"));
+        assert!(crate::preview::tests::take_quick_look_rect().is_some(), "훑어보기 창이 안 그려짐");
+        assert!(matches!(state.preview.shown_content(), Some(syncshell_core::preview::PreviewContent::Text { .. })));
+
+        send_key_with_modifiers(&ctx, &fs, &mut state, egui::Key::ArrowDown, egui::Modifiers::NONE, true);
+        assert_eq!(state.selected, Some(base.join("b.txt")));
+        // 끝에서 멈춘다(폴더는 건너뜀)
+        send_key_with_modifiers(&ctx, &fs, &mut state, egui::Key::ArrowDown, egui::Modifiers::NONE, true);
+        assert_eq!(state.selected, Some(base.join("b.txt")));
+        frames_until_preview(&ctx, &fs, &mut state, &base.join("b.txt"));
+
+        send_key_with_modifiers(&ctx, &fs, &mut state, egui::Key::Escape, egui::Modifiers::NONE, true);
+        assert!(!state.preview.quick_look, "Esc로 안 닫힘");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// DEV-029 A: 눈 버튼으로 미리보기 칸을 켜면, 세로로 긴 탐색기에서는 목록 아래에
+    /// 칸이 생기고 선택한 파일을 읽어 보여 준다.
+    #[test]
+    fn eye_button_toggles_preview_pane_below_list() {
+        let base = temp_dir_with("preview-pane", &["a.txt"]);
+        let fs = settled_view(&base);
+        let ctx = egui::Context::default();
+        let mut state = FilePanelState::default();
+        frame(&ctx, &fs, &mut state);
+        let eye = EYE_RECT.with(|c| c.get()).expect("눈 버튼이 안 그려짐").center();
+        click_at(&ctx, &fs, &mut state, eye, false);
+        assert!(state.preview_pane, "눈 버튼으로 미리보기 칸이 안 켜짐");
+
+        PANE_RECT.with(|c| c.set(None));
+        state.selected = Some(base.join("a.txt"));
+        frames_until_preview(&ctx, &fs, &mut state, &base.join("a.txt"));
+        let pane = PANE_RECT.with(|c| c.get()).expect("미리보기 칸이 안 그려짐");
+        let row = find_first_row_pos(&ctx, &fs);
+        assert!(pane.top() > 300.0 && pane.bottom() <= 600.0 && pane.width() > 300.0, "칸 위치: {pane:?}");
+        assert!(row.y < pane.top());
+        assert_eq!(
+            state.preview.shown_content(),
+            Some(&syncshell_core::preview::PreviewContent::Text { text: "x".into(), encoding: "UTF-8", truncated: false })
+        );
+
+        click_at(&ctx, &fs, &mut state, eye, false);
+        assert!(!state.preview_pane);
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// 한 프레임 그려 즐겨찾기 별 버튼·즐겨찾기 칸 위치를 기록한다.

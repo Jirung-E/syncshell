@@ -2,6 +2,7 @@ pub mod fsops;
 pub mod fsview;
 pub mod interrupt;
 pub mod osc7;
+pub mod preview;
 pub mod pty;
 pub mod session;
 pub mod shell_integration;

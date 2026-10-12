@@ -108,6 +108,8 @@ pub struct UiState {
     pub ui_scale: Option<f64>,
     /// 터미널 글자 크기(UI 배율 100% 기준 pt). 없으면 기본값 — DEV-026
     pub term_font_size: Option<f64>,
+    /// 탐색기 안 미리보기 칸을 켜 뒀는지(DEV-029). 없으면 꺼짐
+    pub preview_pane: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -300,6 +302,7 @@ pub(crate) mod tests {
                     layout: "stacked".to_string(),
                     ui_scale: Some(1.2),
                     term_font_size: Some(14.0),
+                    preview_pane: true,
                 },
             };
             save_state(&state).unwrap();

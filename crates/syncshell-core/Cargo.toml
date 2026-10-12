@@ -16,6 +16,10 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 # 앱이 config.toml을 고칠 때(즐겨찾기, DEV-028) 사용자 주석·순서를 보존한다.
 toml_edit = "0.22"
+# 파일 미리보기(DEV-029) — 이미지 축소 디코딩. eframe이 이미 끌어오는 버전.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico"] }
+# 파일 미리보기(DEV-029) — UTF-8이 아닌 한국어 텍스트(CP949) 판별.
+encoding_rs = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 # alacritty_terminal이 쓰는 rustix-openpty가 유닉스 타깃에서 rustix 0.38을
